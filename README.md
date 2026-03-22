@@ -10,7 +10,7 @@ A pair of browser userscripts for taking back control of your Discord message hi
 
 | Script | Purpose |
 |--------|---------|
-| [`discord_purge_all.user.js`](./discord_purge_all.user.js) | One-time **bulk delete** of all your messages across every channel, DM, and server |
+| [`discord_purge_all.user.js`](./discord_purge_all.user.js) | One-time **bulk delete** of all your messages across every channel, DM, and server — with channel exclusions |
 | [`discord_autodelete.user.js`](./discord_autodelete.user.js) | **Signal-style auto-expiry** — logs every message you send and deletes it after a configurable TTL |
 
 ---
@@ -22,6 +22,7 @@ Discovers and iterates every DM, Group DM, and server text channel, deleting eve
 ### Features
 - 🔍 Auto-discovers all your DMs and server channels
 - 🗑️ Deletes every message your account has sent
+- ⛔ **Channel exclusion list** — skip specific channels or DMs you want to preserve
 - ⏱️ Adaptive rate limiting — slows down when throttled, speeds up over time
 - 📊 Live progress UI embedded in Discord
 - ⏹️ Stop/resume at any time
@@ -35,11 +36,22 @@ Discovers and iterates every DM, Group DM, and server text channel, deleting eve
 3. Paste the contents of [`discord_purge_all.user.js`](./discord_purge_all.user.js) and press **Enter**
 4. A **🗑️ trash icon** appears in the Discord toolbar — click it
 5. Click **Get** next to *Auth Token* and *Author ID*
-6. Click **▶ Start Full Purge** and confirm
+6. (Optional) Go to the **Exclusions** tab to skip channels you want to keep
+7. Click **▶ Start Full Purge** and confirm
 
 **Option B — Userscript Manager (persistent)**
 
-Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/), create a new script, and paste the file contents.
+Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/), create a new script, and paste the file contents. Exclusions are saved persistently between sessions.
+
+### Excluding channels
+
+The **Exclusions** tab lets you protect specific channels or DMs from being purged. Useful for things like a `#quote-book` channel or a DM thread you want to keep intact.
+
+- **Exclude Current Channel** — navigate to any channel and click this to add it instantly. The label is auto-filled from the page title so you can tell what's what at a glance.
+- **Manual ID entry** — paste a channel ID directly with an optional custom label, for channels you don't want to navigate to.
+- Excluded channels are listed with their name, ID, and the date you added them.
+- Remove individual exclusions or clear the whole list at any time.
+- The confirmation dialog before purge shows exactly which channels are being skipped.
 
 ### How long will it take?
 
