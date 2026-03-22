@@ -1,203 +1,93 @@
 // ==UserScript==
 // @name          Discord Full Account Purge
-// @description   Automatically deletes all your messages across all DMs, Group DMs, and Servers
-// @namespace     local
-// @version       1.0
+// @description   Automatically deletes all your messages across all DMs, Group DMs, and Servers. Supports channel/DM exclusion lists.
+// @namespace     https://github.com/YOUR_USERNAME/discord-purge
+// @version       2.0
 // @match         https://discord.com/*
-// @grant         none
+// @grant         GM_getValue
+// @grant         GM_setValue
+// @run-at        document-idle
 // @license       MIT
 // ==/UserScript==
-
-/**
- * HOW TO USE:
- * 1. Open Discord in your browser (discord.com)
- * 2. Open DevTools (F12) → Console tab
- * 3. Paste this entire script and press Enter
- * 4. Click the trash icon that appears in the Discord toolbar
- * 5. Click "Get Token" and "Get Author" to auto-fill your credentials
- * 6. Click "Start Full Purge"
- *
- * NOTES:
- * - This will ask for confirmation before deleting
- * - You can stop at any time with the Stop button
- * - Rate limits are handled automatically with delays
- * - Messages in servers where you lack permission will be skipped
- * - Discord only lets you delete your OWN messages; this script respects that
- */
 
 (function () {
     'use strict';
 
-    // ── Core delete function (works on a single channel) ──────────────────────
+    // ── Persistent storage (GM if available, falls back to session Map) ───────
+    const store = (() => {
+        const hasgm = typeof GM_getValue !== 'undefined';
+        const mem = {};
+        return {
+            get: (k, def) => { try { const raw = hasgm ? GM_getValue(k) : mem[k]; return raw === undefined ? def : JSON.parse(raw); } catch { return def; } },
+            set: (k, v) => { const s = JSON.stringify(v); if (hasgm) GM_setValue(k, s); else mem[k] = s; },
+        };
+    })();
+
+    const KEY_EXCLUSIONS = 'purge_exclusions';
+
+    // ── Core delete function ──────────────────────────────────────────────────
     async function deleteMessagesInChannel(authToken, authorId, guildId, channelId, options = {}) {
-        const {
-            searchDelay = 1500,
-            deleteDelay = 1400,
-            delayIncrement = 150,
-            delayDecrement = -50,
-            delayDecrementPerMsgs = 1000,
-            retryAfterMultiplier = 3000,
-            stopHndl = null,
-            onProgress = null,
-            logFn = console.log,
-        } = options;
-
-        let deleteDelayCurrent = deleteDelay;
-        let delCount = 0;
-        let failCount = 0;
-        let avgPing = 0;
-        let lastPing = 0;
-        let grandTotal = null;
-        let throttledCount = 0;
-        let throttledTotalTime = 0;
-        let offset = 0;
-
+        const { searchDelay=1500, deleteDelay=1400, delayIncrement=150, delayDecrement=-50, delayDecrementPerMsgs=1000, retryAfterMultiplier=3000, stopHndl=null, onProgress=null, logFn=console.log } = options;
+        let deleteDelayCurrent = deleteDelay, delCount = 0, failCount = 0, avgPing = 0, lastPing = 0, grandTotal = null, throttledCount = 0, throttledTotalTime = 0, offset = 0;
         const wait = ms => new Promise(r => setTimeout(r, ms));
-        const msToHMS = s => `${s / 3.6e6 | 0}h ${(s % 3.6e6) / 6e4 | 0}m ${(s % 6e4) / 1000 | 0}s`;
-        const toSnowflake = date => /:/.test(date) ? ((new Date(date).getTime() - 1420070400000) * Math.pow(2, 22)) : date;
-
         const headers = { Authorization: authToken };
 
         async function recurse() {
-            const BASE = guildId === '@me'
-                ? `https://discord.com/api/v6/channels/${channelId}/messages/search`
-                : `https://discord.com/api/v6/guilds/${guildId}/messages/search`;
-
+            const BASE = guildId === '@me' ? `https://discord.com/api/v6/channels/${channelId}/messages/search` : `https://discord.com/api/v6/guilds/${guildId}/messages/search`;
             const params = new URLSearchParams();
             params.set('author_id', authorId);
             if (guildId !== '@me') params.set('channel_id', channelId);
-            params.set('sort_by', 'timestamp');
-            params.set('sort_order', 'desc');
-            params.set('offset', offset);
-
+            params.set('sort_by', 'timestamp'); params.set('sort_order', 'desc'); params.set('offset', offset);
             let resp;
-            try {
-                const s = Date.now();
-                resp = await fetch(`${BASE}?${params}`, { headers });
-                lastPing = Date.now() - s;
-                avgPing = avgPing > 0 ? avgPing * 0.9 + lastPing * 0.1 : lastPing;
-            } catch (err) {
-                logFn('error', `Search error: ${err.message}`);
-                return;
-            }
-
-            if (resp.status === 202) {
-                const { retry_after: w } = await resp.json();
-                throttledCount++; throttledTotalTime += w;
-                logFn('warn', `Channel not indexed yet, waiting ${w}ms…`);
-                await wait(w);
-                return recurse();
-            }
-
+            try { const s = Date.now(); resp = await fetch(`${BASE}?${params}`, { headers }); lastPing = Date.now()-s; avgPing = avgPing>0 ? avgPing*0.9+lastPing*0.1 : lastPing; }
+            catch (err) { logFn('error', `Search error: ${err.message}`); return; }
+            if (resp.status === 202) { const {retry_after:w} = await resp.json(); throttledCount++; throttledTotalTime+=w; logFn('warn',`Not indexed, waiting ${w}ms…`); await wait(w); return recurse(); }
             if (!resp.ok) {
-                if (resp.status === 429) {
-                    const { retry_after: w } = await resp.json();
-                    throttledCount++; throttledTotalTime += w;
-                    logFn('warn', `Rate limited! Cooling down ${w * retryAfterMultiplier}ms…`);
-                    await wait(w * retryAfterMultiplier);
-                    return recurse();
-                }
-                if (resp.status === 403) {
-                    logFn('warn', `No search permission for channel ${channelId} in guild ${guildId}, skipping.`);
-                    return;
-                }
-                logFn('error', `Search failed: HTTP ${resp.status}`);
-                return;
+                if (resp.status===429) { const {retry_after:w}=await resp.json(); throttledCount++;throttledTotalTime+=w; logFn('warn',`Rate limited! Cooling ${w*retryAfterMultiplier}ms…`); await wait(w*retryAfterMultiplier); return recurse(); }
+                if (resp.status===403) { logFn('warn',`No permission for channel ${channelId}, skipping.`); return; }
+                logFn('error',`Search failed: HTTP ${resp.status}`); return;
             }
-
             const data = await resp.json();
             if (!grandTotal) grandTotal = data.total_results;
-
             const hits = data.messages.map(c => c.find(m => m.hit));
-            const toDelete = hits.filter(m => m.type === 0 || m.type === 6);
-            const skipped = hits.filter(m => !toDelete.find(d => d.id === m.id));
-
+            const toDelete = hits.filter(m => m.type===0 || m.type===6);
+            const skipped = hits.filter(m => !toDelete.find(d => d.id===m.id));
             if (toDelete.length === 0) {
-                if (data.total_results - offset > 0) {
-                    offset += 25;
-                    await wait(searchDelay);
-                    return recurse();
-                }
-                logFn('success', `Channel done. Deleted: ${delCount}, Failed: ${failCount}`);
-                return;
+                if (data.total_results-offset > 0) { offset+=25; await wait(searchDelay); return recurse(); }
+                logFn('success',`Channel done. Deleted: ${delCount}, Failed: ${failCount}`); return;
             }
-
-            for (let j = 0; j < toDelete.length; j++) {
+            for (let j=0; j<toDelete.length; j++) {
                 const msg = toDelete[j];
-                if (stopHndl && !stopHndl()) { logFn('warn', 'Stopped by user.'); return; }
-
-                logFn('info', `Deleting message ${msg.id} from ${msg.author.username} (${new Date(msg.timestamp).toLocaleString()})`);
-
-                if (delCount > 0 && delCount % delayDecrementPerMsgs === 0) {
-                    deleteDelayCurrent = Math.max(500, deleteDelayCurrent + delayDecrement);
-                }
-
+                if (stopHndl && !stopHndl()) { logFn('warn','Stopped by user.'); return; }
+                logFn('info',`Deleting message ${msg.id} (${new Date(msg.timestamp).toLocaleString()})`);
+                if (delCount>0 && delCount%delayDecrementPerMsgs===0) deleteDelayCurrent = Math.max(500, deleteDelayCurrent+delayDecrement);
                 try {
                     const s = Date.now();
-                    const dr = await fetch(
-                        `https://discord.com/api/v6/channels/${msg.channel_id}/messages/${msg.id}`,
-                        { headers, method: 'DELETE' }
-                    );
-                    lastPing = Date.now() - s;
-                    avgPing = avgPing * 0.9 + lastPing * 0.1;
-
+                    const dr = await fetch(`https://discord.com/api/v6/channels/${msg.channel_id}/messages/${msg.id}`, { headers, method:'DELETE' });
+                    lastPing = Date.now()-s; avgPing = avgPing*0.9+lastPing*0.1;
                     if (!dr.ok) {
-                        if (dr.status === 429) {
-                            const { retry_after: w } = await dr.json();
-                            throttledCount++; throttledTotalTime += w;
-                            deleteDelayCurrent = Math.min(10000, deleteDelayCurrent + delayIncrement);
-                            logFn('warn', `Rate limited on delete! Cooling ${w * retryAfterMultiplier}ms, new delay: ${deleteDelayCurrent}ms`);
-                            await wait(w * retryAfterMultiplier);
-                            j--; continue;
-                        } else if (dr.status === 403 || dr.status === 400) {
-                            logFn('warn', `Cannot delete ${msg.id} (${dr.status}), skipping.`);
-                            offset++; failCount++;
-                        } else {
-                            logFn('error', `Delete error HTTP ${dr.status} for message ${msg.id}`);
-                            failCount++;
-                        }
-                    } else {
-                        delCount++;
-                        if (onProgress) onProgress(delCount, grandTotal);
-                    }
-                } catch (err) {
-                    logFn('error', `Delete threw: ${err.message}`);
-                    failCount++;
-                }
-
+                        if (dr.status===429) { const {retry_after:w}=await dr.json(); throttledCount++;throttledTotalTime+=w; deleteDelayCurrent=Math.min(10000,deleteDelayCurrent+delayIncrement); logFn('warn',`Rate limited! Cooling ${w*retryAfterMultiplier}ms`); await wait(w*retryAfterMultiplier); j--; continue; }
+                        else if (dr.status===403||dr.status===400) { logFn('warn',`Cannot delete ${msg.id} (${dr.status}), skipping.`); offset++;failCount++; }
+                        else { logFn('error',`Delete error HTTP ${dr.status} for ${msg.id}`); failCount++; }
+                    } else { delCount++; if (onProgress) onProgress(delCount, grandTotal); }
+                } catch(err) { logFn('error',`Delete threw: ${err.message}`); failCount++; }
                 await wait(deleteDelayCurrent);
             }
-
-            if (skipped.length > 0) {
-                grandTotal = Math.max(0, grandTotal - skipped.length);
-                offset += skipped.length;
-            }
-
-            logFn('verb', `Next search in ${searchDelay}ms (offset: ${offset})…`);
-            await wait(searchDelay);
-            return recurse();
+            if (skipped.length>0) { grandTotal=Math.max(0,grandTotal-skipped.length); offset+=skipped.length; }
+            logFn('verb',`Next search in ${searchDelay}ms (offset: ${offset})…`);
+            await wait(searchDelay); return recurse();
         }
-
         return recurse();
     }
 
-    // ── Fetch all channels the user has access to ─────────────────────────────
+    // ── Fetch all channels ────────────────────────────────────────────────────
     async function getAllChannels(authToken) {
         const headers = { Authorization: authToken };
         const channels = [];
-
-        // 1. DMs and Group DMs
         try {
             const r = await fetch('https://discord.com/api/v9/users/@me/channels', { headers });
-            if (r.ok) {
-                const dms = await r.json();
-                for (const dm of dms) {
-                    channels.push({ guildId: '@me', channelId: dm.id, label: dm.name || (dm.recipients?.[0]?.username ?? 'DM') });
-                }
-            }
-        } catch (e) { console.warn('Could not fetch DMs:', e); }
-
-        // 2. Guilds → all channels in each
+            if (r.ok) { const dms = await r.json(); for (const dm of dms) channels.push({ guildId:'@me', channelId:dm.id, label:dm.name||(dm.recipients?.[0]?.username??'DM') }); }
+        } catch(e) { console.warn('Could not fetch DMs:',e); }
         try {
             const r = await fetch('https://discord.com/api/v9/users/@me/guilds', { headers });
             if (r.ok) {
@@ -205,29 +95,33 @@
                 for (const guild of guilds) {
                     try {
                         const cr = await fetch(`https://discord.com/api/v9/guilds/${guild.id}/channels`, { headers });
-                        if (cr.ok) {
-                            const gchannels = await cr.json();
-                            // Text channels (type 0) and announcement channels (type 5) and threads (type 10,11,12)
-                            const textChannels = gchannels.filter(c => [0, 5, 10, 11, 12].includes(c.type));
-                            for (const ch of textChannels) {
-                                channels.push({ guildId: guild.id, channelId: ch.id, label: `${guild.name} → #${ch.name}` });
-                            }
-                        }
-                    } catch (e) { console.warn(`Could not fetch channels for guild ${guild.name}:`, e); }
-                    await new Promise(r => setTimeout(r, 300)); // small pause between guilds
+                        if (cr.ok) { const gchannels = await cr.json(); gchannels.filter(c=>[0,5,10,11,12].includes(c.type)).forEach(ch => channels.push({ guildId:guild.id, channelId:ch.id, label:`${guild.name} → #${ch.name}` })); }
+                    } catch(e) { console.warn(`Could not fetch channels for ${guild.name}:`,e); }
+                    await new Promise(r => setTimeout(r, 300));
                 }
             }
-        } catch (e) { console.warn('Could not fetch guilds:', e); }
-
+        } catch(e) { console.warn('Could not fetch guilds:',e); }
         return channels;
     }
 
-    // ── UI ────────────────────────────────────────────────────────────────────
+    // ── Exclusion helpers ─────────────────────────────────────────────────────
+    const getExclusions = () => store.get(KEY_EXCLUSIONS, {});
+    const saveExclusions = ex => store.set(KEY_EXCLUSIONS, ex);
+    const addExclusion = (channelId, label) => { const ex=getExclusions(); ex[channelId]={label,addedAt:new Date().toLocaleString()}; saveExclusions(ex); };
+    const removeExclusion = channelId => { const ex=getExclusions(); delete ex[channelId]; saveExclusions(ex); };
+    const isExcluded = channelId => !!getExclusions()[channelId];
+    const getCurrentChannelId = () => { const m=location.href.match(/channels\/[\w@]+\/(\d+)/); return m?m[1]:null; };
+
+    // ── CSS ───────────────────────────────────────────────────────────────────
     const css = `
         #dcpurge-btn{position:relative;height:24px;width:auto;flex:0 0 auto;margin:0 8px;cursor:pointer;color:var(--interactive-normal);}
         #dcpurge{position:fixed;top:60px;right:10px;bottom:10px;width:820px;z-index:9999;color:var(--text-normal);background:var(--background-secondary);box-shadow:var(--elevation-high);border-radius:6px;display:flex;flex-direction:column;font-family:sans-serif;}
         #dcpurge .hdr{padding:12px 16px;background:var(--background-tertiary);border-radius:6px 6px 0 0;font-weight:bold;display:flex;justify-content:space-between;align-items:center;}
-        #dcpurge .form{padding:10px;background:var(--background-secondary);border-bottom:1px solid rgba(255,255,255,.1);}
+        #dcpurge .tabs{display:flex;border-bottom:1px solid rgba(255,255,255,.1);background:var(--background-secondary);}
+        #dcpurge .tab{padding:8px 18px;cursor:pointer;font-size:13px;color:#72767d;border-bottom:2px solid transparent;margin-bottom:-1px;user-select:none;}
+        #dcpurge .tab.active{color:var(--text-normal);border-bottom-color:#5865f2;}
+        #dcpurge .tab-panel{display:none;padding:10px;flex-direction:column;gap:6px;}
+        #dcpurge .tab-panel.active{display:flex;}
         #dcpurge input[type=password],#dcpurge input[type=text]{background:#202225;color:#b9bbbe;border:0;border-radius:4px;padding:0 .5em;height:28px;width:220px;margin:3px;}
         #dcpurge button{color:#fff;background:#5865f2;border:0;border-radius:4px;padding:4px 12px;margin:3px;cursor:pointer;font-size:13px;}
         #dcpurge button.danger{background:#ed4245;}
@@ -236,12 +130,20 @@
         #dcpurge .log{overflow:auto;font-size:.72rem;font-family:Consolas,monospace;flex-grow:1;padding:10px;white-space:pre-wrap;}
         #dcpurge .status-bar{padding:6px 12px;background:var(--background-tertiary);border-radius:0 0 6px 6px;font-size:12px;display:flex;gap:16px;align-items:center;}
         #dcpurge progress{width:200px;}
+        #dcpurge .ex-list{list-style:none;margin:6px 0 0;padding:0;overflow-y:auto;max-height:260px;}
+        #dcpurge .ex-list li{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;font-size:12px;}
+        #dcpurge .ex-list li:hover{background:rgba(255,255,255,.05);}
+        #dcpurge .ex-label{flex:1;color:#b9bbbe;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+        #dcpurge .ex-id{color:#4f545c;font-size:10px;font-family:monospace;}
+        #dcpurge .ex-date{color:#4f545c;font-size:10px;}
+        #dcpurge .ex-add-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+        #dcpurge .ex-empty{color:#4f545c;font-size:12px;padding:16px;text-align:center;}
+        #dcpurge .badge-count{display:inline-block;background:#ed4245;color:#fff;border-radius:8px;font-size:10px;padding:1px 6px;margin-left:4px;vertical-align:middle;}
         .dcpurge-info{color:#00b0f4}.dcpurge-warn{color:#faa61a}.dcpurge-error{color:#ed4245}.dcpurge-success{color:#3ba55d}.dcpurge-verb{color:#72767d}
     `;
-    const style = document.createElement('style');
-    style.textContent = css;
-    document.head.appendChild(style);
+    document.head.appendChild(Object.assign(document.createElement('style'), { textContent: css }));
 
+    // ── Panel HTML ────────────────────────────────────────────────────────────
     const panel = document.createElement('div');
     panel.id = 'dcpurge';
     panel.style.display = 'none';
@@ -250,7 +152,11 @@
             🗑️ Discord Full Account Purge
             <button id="dcpurge-close" style="background:transparent;font-size:18px;padding:0 6px;">✕</button>
         </div>
-        <div class="form">
+        <div class="tabs">
+            <div class="tab active" data-tab="main">Purge</div>
+            <div class="tab" data-tab="exclusions">Exclusions <span class="badge-count" id="dcp-ex-badge" style="display:none"></span></div>
+        </div>
+        <div class="tab-panel active" id="tab-main">
             <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;">
                 <div>
                     <div style="font-size:12px;color:#72767d;margin-bottom:2px;">Auth Token *</div>
@@ -263,17 +169,28 @@
                     <button id="dcp-get-author">Get</button>
                 </div>
             </div>
-            <div style="margin-top:10px;font-size:12px;color:#faa61a;">
-                ⚠️ This will delete ALL messages sent by your account across all DMs and servers. This is irreversible.
-            </div>
-            <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+            <div style="font-size:12px;color:#faa61a;margin-top:4px;">⚠️ Deletes ALL your messages everywhere except excluded channels. Irreversible.</div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                 <button class="success" id="dcp-start">▶ Start Full Purge</button>
                 <button class="danger" id="dcp-stop" disabled>⏹ Stop</button>
                 <button id="dcp-clear">Clear Log</button>
                 <label style="font-size:12px;"><input type="checkbox" id="dcp-autoscroll" checked> Auto-scroll</label>
             </div>
         </div>
-        <div class="log" id="dcp-log">Ready. Fill in your token and author ID, then press Start Full Purge.\n</div>
+        <div class="tab-panel" id="tab-exclusions">
+            <div style="font-size:12px;color:#72767d;">Excluded channels are completely skipped — your messages there will <strong>not</strong> be deleted.</div>
+            <div class="ex-add-row">
+                <button id="dcp-ex-add-current" class="success">＋ Exclude Current Channel</button>
+                <span style="font-size:11px;color:#4f545c;">or paste an ID:</span>
+                <input type="text" id="dcp-ex-manual-id" placeholder="Channel ID" style="width:150px;">
+                <input type="text" id="dcp-ex-manual-label" placeholder="Label (optional)" style="width:150px;">
+                <button id="dcp-ex-add-manual">Add</button>
+                <button id="dcp-ex-clear-all" class="danger" style="margin-left:auto;">Clear All</button>
+            </div>
+            <ul class="ex-list" id="dcp-ex-list"></ul>
+            <div class="ex-empty" id="dcp-ex-empty">No exclusions yet. Channels added here will be skipped during purge.</div>
+        </div>
+        <div class="log" id="dcp-log" style="flex-grow:1;">Ready. Fill in your token and author ID, then press Start Full Purge.\n</div>
         <div class="status-bar">
             <span id="dcp-channel-status">Idle</span>
             <progress id="dcp-progress" value="0" max="1" style="display:none;"></progress>
@@ -282,127 +199,156 @@
     `;
     document.body.appendChild(panel);
 
-    const btn = document.createElement('div');
-    btn.id = 'dcpurge-btn';
-    btn.title = 'Full Account Purge';
-    btn.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24"><path fill="currentColor" d="M15 3.999V2H9V3.999H3V5.999H21V3.999H15Z"/><path fill="currentColor" d="M5 6.99902V18.999C5 20.101 5.897 20.999 7 20.999H17C18.103 20.999 19 20.101 19 18.999V6.99902H5ZM11 17H9V11H11V17ZM15 17H13V11H15V17Z"/></svg>`;
-    btn.onclick = () => { panel.style.display = panel.style.display === 'none' ? '' : 'none'; };
-
-    function mountBtn() {
-        const toolbar = document.querySelector('[class^=toolbar]');
-        if (toolbar && !toolbar.contains(btn)) toolbar.appendChild(btn);
-    }
-    new MutationObserver(() => { if (!document.body.contains(btn)) mountBtn(); })
-        .observe(document.body, { childList: true, subtree: true });
-    mountBtn();
-
-    // UI helpers
+    // ── Log helper ────────────────────────────────────────────────────────────
     const logEl = panel.querySelector('#dcp-log');
     const autoScroll = panel.querySelector('#dcp-autoscroll');
-    const progress = panel.querySelector('#dcp-progress');
-    const percent = panel.querySelector('#dcp-percent');
-    const channelStatus = panel.querySelector('#dcp-channel-status');
-
     function addLog(type, msg) {
-        const line = document.createElement('div');
-        line.className = type ? `dcpurge-${type}` : '';
-        line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        const line = Object.assign(document.createElement('div'), { className: type?`dcpurge-${type}`:'', textContent:`[${new Date().toLocaleTimeString()}] ${msg}` });
         logEl.appendChild(line);
-        // Cap log at 2000 entries
         while (logEl.children.length > 2000) logEl.removeChild(logEl.firstChild);
         if (autoScroll.checked) line.scrollIntoView(false);
     }
 
-    panel.querySelector('#dcpurge-close').onclick = () => { panel.style.display = 'none'; };
-    panel.querySelector('#dcp-clear').onclick = () => { logEl.innerHTML = ''; };
+    // ── Tab switching ─────────────────────────────────────────────────────────
+    panel.querySelectorAll('.tab').forEach(tab => {
+        tab.onclick = () => {
+            panel.querySelectorAll('.tab, .tab-panel').forEach(el => el.classList.remove('active'));
+            tab.classList.add('active');
+            panel.querySelector(`#tab-${tab.dataset.tab}`).classList.add('active');
+            if (tab.dataset.tab === 'exclusions') renderExclusionList();
+        };
+    });
+
+    // ── Exclusion list rendering ──────────────────────────────────────────────
+    function renderExclusionList() {
+        const list = panel.querySelector('#dcp-ex-list');
+        const empty = panel.querySelector('#dcp-ex-empty');
+        const badge = panel.querySelector('#dcp-ex-badge');
+        const entries = Object.entries(getExclusions());
+        list.innerHTML = '';
+        if (entries.length === 0) { empty.style.display=''; badge.style.display='none'; return; }
+        empty.style.display = 'none';
+        badge.textContent = entries.length; badge.style.display = '';
+        entries.forEach(([channelId, { label, addedAt }]) => {
+            const li = document.createElement('li');
+            li.innerHTML = `<span class="ex-label" title="${label}">${label}</span><span class="ex-id">${channelId}</span><span class="ex-date">${addedAt}</span><button class="danger" style="padding:2px 8px;font-size:11px;" data-id="${channelId}">Remove</button>`;
+            li.querySelector('button').onclick = () => { removeExclusion(channelId); addLog('warn',`Removed exclusion: ${label} (${channelId})`); renderExclusionList(); };
+            list.appendChild(li);
+        });
+    }
+
+    // ── Exclusion UI events ───────────────────────────────────────────────────
+    panel.querySelector('#dcp-ex-add-current').onclick = () => {
+        const channelId = getCurrentChannelId();
+        if (!channelId) { addLog('warn','Navigate to a channel first.'); return; }
+        if (isExcluded(channelId)) { addLog('warn',`Channel ${channelId} is already excluded.`); return; }
+        const label = document.querySelector('title')?.textContent?.replace(' | Discord','').trim() || `Channel ${channelId}`;
+        addExclusion(channelId, label);
+        addLog('success',`✅ Excluded: ${label} (${channelId})`);
+        panel.querySelector('.tab[data-tab="exclusions"]').click();
+    };
+
+    panel.querySelector('#dcp-ex-add-manual').onclick = () => {
+        const id = panel.querySelector('#dcp-ex-manual-id').value.trim();
+        const label = panel.querySelector('#dcp-ex-manual-label').value.trim() || `Channel ${id}`;
+        if (!id||!/^\d+$/.test(id)) { addLog('error','Enter a valid numeric channel ID.'); return; }
+        if (isExcluded(id)) { addLog('warn',`Channel ${id} is already excluded.`); return; }
+        addExclusion(id, label);
+        panel.querySelector('#dcp-ex-manual-id').value = '';
+        panel.querySelector('#dcp-ex-manual-label').value = '';
+        addLog('success',`✅ Excluded: ${label} (${id})`);
+        renderExclusionList();
+    };
+
+    panel.querySelector('#dcp-ex-clear-all').onclick = () => {
+        const count = Object.keys(getExclusions()).length;
+        if (!count) { addLog('warn','No exclusions to clear.'); return; }
+        if (!window.confirm(`Remove all ${count} exclusions?`)) return;
+        saveExclusions({});
+        addLog('warn',`Cleared all ${count} exclusions.`);
+        renderExclusionList();
+    };
+
+    // ── Main UI events ────────────────────────────────────────────────────────
+    panel.querySelector('#dcpurge-close').onclick = () => { panel.style.display='none'; };
+    panel.querySelector('#dcp-clear').onclick = () => { logEl.innerHTML=''; };
 
     panel.querySelector('#dcp-get-token').onclick = () => {
         try {
             window.dispatchEvent(new Event('beforeunload'));
             const iframe = document.createElement('iframe');
             document.body.appendChild(iframe);
-            const ls = iframe.contentWindow.localStorage;
-            panel.querySelector('#dcp-token').value = JSON.parse(ls.token || localStorage.token);
+            panel.querySelector('#dcp-token').value = JSON.parse(iframe.contentWindow.localStorage.token||localStorage.token);
             document.body.removeChild(iframe);
-        } catch (e) { addLog('error', 'Could not auto-get token. Please paste it manually.'); }
+        } catch { addLog('error','Could not auto-get token. Please paste it manually.'); }
     };
-
     panel.querySelector('#dcp-get-author').onclick = () => {
-        try {
-            panel.querySelector('#dcp-author').value = JSON.parse(localStorage.user_id_cache);
-        } catch (e) { addLog('error', 'Could not auto-get author ID. Please paste it manually.'); }
+        try { panel.querySelector('#dcp-author').value = JSON.parse(localStorage.user_id_cache); }
+        catch { addLog('error','Could not auto-get author ID. Please paste it manually.'); }
     };
 
     let stopFlag = false;
+    panel.querySelector('#dcp-stop').onclick = () => { stopFlag=true; addLog('warn','Stop requested…'); };
 
-    panel.querySelector('#dcp-stop').onclick = () => {
-        stopFlag = true;
-        addLog('warn', 'Stop requested. Will halt after current operation…');
-    };
+    const progress = panel.querySelector('#dcp-progress');
+    const percent = panel.querySelector('#dcp-percent');
+    const channelStatus = panel.querySelector('#dcp-channel-status');
 
     panel.querySelector('#dcp-start').onclick = async () => {
         const authToken = panel.querySelector('#dcp-token').value.trim();
         const authorId = panel.querySelector('#dcp-author').value.trim();
-
-        if (!authToken || !authorId) {
-            addLog('error', 'Auth token and Author ID are required!');
-            return;
-        }
+        if (!authToken||!authorId) { addLog('error','Auth token and Author ID are required!'); return; }
 
         const startBtn = panel.querySelector('#dcp-start');
         const stopBtn = panel.querySelector('#dcp-stop');
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-        stopFlag = false;
+        startBtn.disabled=true; stopBtn.disabled=false; stopFlag=false;
+        panel.querySelector('.tab[data-tab="main"]').click();
 
-        addLog('info', 'Discovering all channels and DMs…');
+        addLog('info','Discovering all channels and DMs…');
         channelStatus.textContent = 'Discovering channels…';
 
-        let channels;
-        try {
-            channels = await getAllChannels(authToken);
-        } catch (e) {
-            addLog('error', `Failed to discover channels: ${e.message}`);
-            startBtn.disabled = false;
-            stopBtn.disabled = true;
-            return;
-        }
+        let allChannels;
+        try { allChannels = await getAllChannels(authToken); }
+        catch(e) { addLog('error',`Failed to discover channels: ${e.message}`); startBtn.disabled=false; stopBtn.disabled=true; return; }
 
-        addLog('success', `Found ${channels.length} channels/DMs to process.`);
+        const exclusions = getExclusions();
+        const excluded = allChannels.filter(ch => exclusions[ch.channelId]);
+        const channels = allChannels.filter(ch => !exclusions[ch.channelId]);
 
-        if (!window.confirm(`Found ${channels.length} channels and DMs.\n\nThis will permanently delete ALL messages you have sent across your entire Discord account.\n\nThis CANNOT be undone. Continue?`)) {
-            addLog('warn', 'Aborted by user.');
-            startBtn.disabled = false;
-            stopBtn.disabled = true;
-            return;
-        }
+        addLog('success',`Found ${allChannels.length} total channels/DMs.`);
+        if (excluded.length>0) { addLog('warn',`Skipping ${excluded.length} excluded channel(s):`); excluded.forEach(ch => addLog('verb',`  ⛔ ${ch.label} (${ch.channelId})`)); }
+        addLog('info',`Will process ${channels.length} channel(s).`);
 
-        progress.style.display = '';
-        progress.max = channels.length;
-        progress.value = 0;
+        if (!window.confirm(
+            `Found ${allChannels.length} total channels/DMs.\n`+
+            (excluded.length>0?`Skipping ${excluded.length} excluded channel(s).\n`:'')+
+            `\nWill delete your messages from ${channels.length} channel(s).\nThis CANNOT be undone. Continue?`
+        )) { addLog('warn','Aborted by user.'); startBtn.disabled=false; stopBtn.disabled=true; return; }
 
-        for (let i = 0; i < channels.length; i++) {
-            if (stopFlag) { addLog('warn', 'Purge stopped by user.'); break; }
+        progress.style.display=''; progress.max=channels.length; progress.value=0;
 
+        for (let i=0; i<channels.length; i++) {
+            if (stopFlag) { addLog('warn','Purge stopped by user.'); break; }
             const ch = channels[i];
-            channelStatus.textContent = `Channel ${i + 1}/${channels.length}: ${ch.label}`;
-            progress.value = i + 1;
-            percent.textContent = `${Math.round((i + 1) / channels.length * 100)}%`;
-            addLog('info', `\n── Processing: ${ch.label} (guild: ${ch.guildId}, channel: ${ch.channelId})`);
-
-            await deleteMessagesInChannel(authToken, authorId, ch.guildId, ch.channelId, {
-                stopHndl: () => !stopFlag,
-                logFn: (type, msg) => addLog(type, msg),
-            });
-
-            // Small pause between channels
+            channelStatus.textContent = `Channel ${i+1}/${channels.length}: ${ch.label}`;
+            progress.value=i+1; percent.textContent=`${Math.round((i+1)/channels.length*100)}%`;
+            addLog('info',`\n── Processing: ${ch.label} (guild: ${ch.guildId}, channel: ${ch.channelId})`);
+            await deleteMessagesInChannel(authToken, authorId, ch.guildId, ch.channelId, { stopHndl:()=>!stopFlag, logFn:(type,msg)=>addLog(type,msg) });
             await new Promise(r => setTimeout(r, 800));
         }
 
-        addLog('success', '\n✅ Full purge complete!');
-        channelStatus.textContent = 'Done';
-        startBtn.disabled = false;
-        stopBtn.disabled = true;
+        addLog('success','\n✅ Full purge complete!');
+        channelStatus.textContent='Done'; startBtn.disabled=false; stopBtn.disabled=true;
     };
 
+    // ── Toolbar button ────────────────────────────────────────────────────────
+    const btn = document.createElement('div');
+    btn.id='dcpurge-btn'; btn.title='Full Account Purge';
+    btn.innerHTML=`<svg width="24" height="24" viewBox="0 0 24 24"><path fill="currentColor" d="M15 3.999V2H9V3.999H3V5.999H21V3.999H15Z"/><path fill="currentColor" d="M5 6.99902V18.999C5 20.101 5.897 20.999 7 20.999H17C18.103 20.999 19 20.101 19 18.999V6.99902H5ZM11 17H9V11H11V17ZM15 17H13V11H15V17Z"/></svg>`;
+    btn.onclick=()=>{ panel.style.display=panel.style.display==='none'?'':'none'; if(panel.style.display!=='none') renderExclusionList(); };
+    function mountBtn() { const t=document.querySelector('[class^=toolbar]'); if(t&&!t.contains(btn)) t.appendChild(btn); }
+    new MutationObserver(()=>{ if(!document.body.contains(btn)) mountBtn(); }).observe(document.body,{childList:true,subtree:true});
+    mountBtn();
+
+    renderExclusionList();
 })();
