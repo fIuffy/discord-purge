@@ -1,7 +1,6 @@
 # discord-purge
 
-Two userscripts for cleaning up your Discord message history.
-
+### Two userscripts for cleaning up your Discord message history.
 
 Discord lets you delete your account but doesn't delete the messages tied to it; they stay visible to everyone in whatever servers or DMs they were sent in. This project exists to fix that. These scripts let you actually wipe your message history before you go, or just on an ongoing basis if you'd rather not leave a permanent record behind.
 
