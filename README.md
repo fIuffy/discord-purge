@@ -12,7 +12,7 @@ Two userscripts for cleaning up your Discord message history.
 | Script | Purpose |
 |--------|---------|
 | [`discord_purge_all.user.js`](./discord_purge_all.user.js) | Bulk delete all your messages across every channel, DM, and server |
-| [`discord_autodelete.user.js`](./discord_autodelete.user.js) | Signal-style auto-expiring messages - deletes what you send after a configurable TTL |
+| [`discord_autodelete.user.js`](./discord_autodelete.user.js) | Signal-style auto-expiring messages - deletes what you send after a configurable Time to Live (TTL) |
 
 ---
 
