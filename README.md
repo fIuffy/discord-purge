@@ -23,9 +23,9 @@ Finds and deletes every message your account has sent across all DMs and servers
 
 ### Features
 
-- Auto-discovers DMs and server channels via the live API
+- Auto-discovers DMs, friends list DMs, and server channels via the live API
 - Data package import to catch channels the API misses
-- Channel exclusion list, skip anything you want to keep
+- Channel exclusion list - skip anything you want to keep
 - Adaptive rate limiting
 - Live progress bar and running deleted-message counter
 - Stop at any time
@@ -46,18 +46,28 @@ Finds and deletes every message your account has sent across all DMs and servers
 
 Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/), create a new script, and paste the contents. Settings and exclusions persist between sessions.
 
+### How channel discovery works
+
+The script casts as wide a net as possible before starting. It pulls from three sources and deduplicates automatically:
+
+1. **Open DMs and group DMs** currently visible in your sidebar
+2. **Friends list** - opens a DM channel with every friend on your account, catching DMs you dismissed from your sidebar but never actually lost
+3. **All text channels** in every server you are currently in
+
+On top of that, you can import your Discord data package to catch anything the live API cannot reach.
+
 ### Importing your data package
 
-The live API only returns channels currently visible to you. Your Discord data package has a full record of every channel you've ever sent a message in.
+The live API only returns channels currently visible to you. Your Discord data package has a full record of every channel you have ever sent a message in, including servers you have left and accounts that have since been deleted.
 
 **Getting it:**
-1. Discord → User Settings → Privacy & Safety → Request Data Export
+1. Discord -> User Settings -> Privacy & Safety -> Request Data Export
 2. Wait for the email (a few hours to a few days)
 3. Download the zip
 
 **Importing it:**
 1. Open the purge panel and go to the **Data Package** tab
-2. Drop in either `messages/index.json` from the unzipped folder, or the whole zip, the script finds the right file automatically
+2. Drop in either `messages/index.json` from the unzipped folder, or the whole zip - the script finds the right file automatically
 3. Imported channels are merged with live-discovered ones, duplicates removed
 
 ### Excluding channels
@@ -70,13 +80,13 @@ Go to the **Exclusions** tab to skip channels you don't want touched.
 
 ### How long does it take?
 
-Discord's API rate limits mean roughly 1–2 seconds per deletion.
+Discord's API rate limits mean roughly 1-2 seconds per deletion.
 
 | Messages | Rough estimate |
-|----------|---------------|
-| 1,000    | ~30 min       |
-| 10,000   | ~4–5 hours    |
-| 50,000+  | Overnight     |
+|----------|----------------|
+| 1,000    | ~30 min        |
+| 10,000   | ~4-5 hours     |
+| 50,000+  | Overnight      |
 
 ---
 
