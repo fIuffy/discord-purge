@@ -143,14 +143,51 @@
     async function getAllChannels(authToken) {
         const headers = { Authorization: authToken };
         const channels = [];
+        const seenChannelIds = new Set();
+
+        const pushChannel = (ch) => {
+            if (!seenChannelIds.has(ch.channelId)) {
+                seenChannelIds.add(ch.channelId);
+                channels.push(ch);
+            }
+        };
+
+        // 1. Open DMs and group DMs (currently visible in sidebar)
         try {
             const r = await fetch('https://discord.com/api/v9/users/@me/channels', { headers });
             if (r.ok) {
                 const dms = await r.json();
                 for (const dm of dms)
-                    channels.push({ guildId:'@me', channelId:dm.id, label:dm.name||(dm.recipients?.[0]?.username??'DM'), source:'live' });
+                    pushChannel({ guildId:'@me', channelId:dm.id, label:dm.name||(dm.recipients?.[0]?.username??'DM'), source:'live' });
             }
         } catch(e) { console.warn('Could not fetch DMs:',e); }
+
+        // 2. Friends list — open (or re-open) a DM with each friend to get its channel ID.
+        //    This catches DMs that have been closed/hidden from the sidebar but still exist.
+        try {
+            const r = await fetch('https://discord.com/api/v9/users/@me/relationships', { headers });
+            if (r.ok) {
+                const relationships = await r.json();
+                // type 1 = friend
+                const friends = relationships.filter(rel => rel.type === 1);
+                for (const friend of friends) {
+                    try {
+                        // POST to create/reopen a DM — safe, just returns the channel object
+                        const dr = await fetch('https://discord.com/api/v9/users/@me/channels', {
+                            method: 'POST',
+                            headers: { ...headers, 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ recipient_id: friend.id }),
+                        });
+                        if (dr.ok) {
+                            const dm = await dr.json();
+                            pushChannel({ guildId:'@me', channelId:dm.id, label:`DM with ${friend.user?.username ?? friend.id}`, source:'live' });
+                        }
+                    } catch(e) { console.warn(`Could not open DM for friend ${friend.id}:`, e); }
+                    await new Promise(r => setTimeout(r, 200));
+                }
+            }
+        } catch(e) { console.warn('Could not fetch friends list:',e); }
+        // 3. Guild text channels
         try {
             const r = await fetch('https://discord.com/api/v9/users/@me/guilds', { headers });
             if (r.ok) {
@@ -161,7 +198,7 @@
                         if (cr.ok) {
                             const gchannels = await cr.json();
                             gchannels.filter(c=>[0,5,10,11,12].includes(c.type)).forEach(ch =>
-                                channels.push({ guildId:guild.id, channelId:ch.id, label:`${guild.name} → #${ch.name}`, source:'live' })
+                                pushChannel({ guildId:guild.id, channelId:ch.id, label:`${guild.name} → #${ch.name}`, source:'live' })
                             );
                         }
                     } catch(e) { console.warn(`Could not fetch channels for ${guild.name}:`,e); }
@@ -613,7 +650,7 @@
         panel.querySelector('.tab[data-tab="main"]').click();
 
         // ── Step 1: live discovery ──
-        addLog('info','Discovering channels via live API…');
+        addLog('info','Discovering channels via live API (DMs, friends list, servers)…');
         channelStatus.textContent = 'Discovering channels…';
         let liveChannels = [];
         try { liveChannels = await getAllChannels(authToken); }
