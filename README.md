@@ -15,7 +15,7 @@ Two scripts: one that wipes everything in bulk, one that makes messages disappea
 | Script | What it does |
 |--------|-------------|
 | [`discord_purge_all.user.js`](./discord_purge_all.user.js) | Bulk delete every message your account has ever sent, across every server, DM, and group chat |
-| [`discord_autodelete.user.js`](./discord_autodelete.user.js) | Automatically delete messages you send after a configured time limit (per-channel) |
+| [`discord_autodelete.user.js`](./discord_autodelete.user.js) | Automatically delete messages you send after a configured time limit, per-channel |
 
 No external servers. No data collection. Everything runs in your browser using your own credentials against Discord's own API.
 
@@ -28,7 +28,7 @@ No external servers. No data collection. Everything runs in your browser using y
 The script searches Discord's API for messages authored by your account and deletes them. It covers three sources automatically:
 
 1. **Open DMs and group DMs** in your sidebar
-2. **Friends list** - re-opens a DM channel with every friend, catching conversations you dismissed from your sidebar
+2. **Friends list** - re-opens a DM channel with every friend, catching conversations you dismissed from your sidebar. Handles rate limits and retries automatically, including dormant DMs that Discord throttles harder.
 3. **All text channels** in every server you are currently in
 
 On top of that, you can import your **Discord data package**, which contains a complete index of every channel you have ever sent a message in - including servers you have left, closed DMs, and conversations with accounts that have since been deleted. This is the most thorough path to a full wipe.
@@ -51,7 +51,7 @@ Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https:/
 
 ### Importing your Discord data package
 
-This is the recommended step if you want complete coverage. The live API can only see channels that are currently accessible to your account. Your data package has the full picture.
+This is the recommended step if you want complete coverage. The live API can only see channels currently accessible to your account. Your data package has the full picture.
 
 **Requesting it:**
 1. Discord -> User Settings -> Privacy & Safety -> Request Data Export
@@ -61,18 +61,17 @@ This is the recommended step if you want complete coverage. The live API can onl
 
 **Importing it:**
 1. Open the purge panel and go to the **Data Package** tab
-2. Drop in either `messages/index.json` from the unzipped folder, or the entire zip file - the script extracts what it needs automatically
-3. Channels from the package are merged with the live-discovered ones, duplicates removed
+2. Drop in either `messages/index.json` from the unzipped folder, or the entire zip - the script extracts what it needs automatically
+3. Channels from the package are merged with live-discovered ones, duplicates removed
 4. Start the purge as normal
 
 ### Excluding channels
 
-If there are channels you want to leave untouched, go to the **Exclusions** tab before starting.
+If there are channels you want left untouched, go to the **Exclusions** tab before starting.
 
 - Navigate to any channel and click **Exclude Current Channel** to add it by name automatically
 - Or paste a channel ID manually with an optional label
-- Exclusions are listed with name, ID, and the date added
-- Remove them individually or clear all at once
+- Remove exclusions individually or clear all at once
 
 The confirmation dialog before the purge starts shows a full breakdown of what will be processed and what is being skipped.
 
@@ -92,46 +91,43 @@ The script handles rate limit responses automatically - it backs off when Discor
 
 ## Script 2 - AutoDelete (expiring messages)
 
-Hooks into Discord's network activity to intercept messages you send. When you send a message in a channel where AutoDelete is enabled, the script logs the message ID and schedules it for deletion after your configured TTL. A background process checks every 30 seconds and deletes anything that has expired.
+Periodically searches each enabled channel for messages you have sent and deletes any that are older than the configured TTL. Runs every 60 seconds in the background, and also fires immediately when you switch back to the tab.
 
-Think of it like disappearing messages, but one you control entirely.
-
-**Requires Tampermonkey or Violentmonkey** for persistent storage - the message queue needs to survive page refreshes.
+**Requires Tampermonkey or Violentmonkey** for persistent storage.
 
 ### Setup
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
 2. Create a new userscript and paste `discord_autodelete.user.js`
 3. Open Discord - a clock icon appears in the toolbar
-4. Click **Get** next to Auth Token and Author ID, then **Save**
-5. Set a Global TTL in seconds (see reference below)
-6. Navigate to any channel and click **Enable AutoDelete**
+4. Click **Get** next to Auth Token and Author ID, then **Save settings**
+5. Set a Global TTL in seconds
+6. Navigate to any channel and click **Enable**, or manage all channels from the **Channels** tab
 
-From that point on, every message you send in that channel will be deleted automatically once the TTL expires. You can set different TTLs per channel or rely on the global default.
+### The panel
+
+- **Settings** - credentials, global TTL, quick toggle for the current channel, and a manual scan button
+- **Channels** - list of every enabled channel with inline TTL editing and a disable button, no navigating required
+- **Log** - event log for every scan, deletion, and error
 
 ### TTL reference
 
 | Seconds  | Duration |
 |----------|----------|
-| `60`     | 1 minute |
 | `3600`   | 1 hour   |
 | `86400`  | 1 day    |
 | `604800` | 1 week   |
 
-### How the interception works
+### How it works
 
 ```
-You send a message
+Every 60 seconds (or when you switch back to the tab):
        |
-The script wraps window.fetch() and sees the successful POST response
+Search each enabled channel for messages by your account
        |
-Message ID + scheduled delete time saved to Tampermonkey local storage
+Any message older than the TTL gets a DELETE request
        |
-Background ticker fires every 30 seconds
-       |
-Any message past its delete time gets a DELETE request
-       |
-Failed deletes are retried on the next tick
+Failed deletes are retried on the next scan
 ```
 
 Your token is only ever stored in Tampermonkey's local storage on your own machine. It is never sent anywhere except Discord's own API.
@@ -141,7 +137,7 @@ Your token is only ever stored in Tampermonkey's local storage on your own machi
 ## Frequently asked questions
 
 **Does this actually delete messages or just hide them?**
-It sends a DELETE request to Discord's API for each message. The message is removed from Discord's servers. Per their own documentation, manually deleted messages are not retained and will not appear in data packages.
+It sends DELETE requests to Discord's API. The messages are removed from Discord's servers. Per their own documentation, manually deleted messages are not retained and will not appear in data packages.
 
 **What about messages in servers I have already left?**
 The live API cannot reach those. Import your data package - it indexes every channel you ever sent a message in, regardless of whether you are still a member.
