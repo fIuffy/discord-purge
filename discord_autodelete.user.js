@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name          Discord AutoDelete - Signal-style Expiring Messages
-// @description   Automatically deletes your Discord messages after a configurable TTL. Works per-channel.
+// @description   Automatically deletes your Discord messages after a configurable TTL. Polls each enabled channel for your messages and deletes ones older than the TTL.
 // @namespace     https://github.com/fIuffy/discord-purge
-// @version       3.0
+// @version       4.0
 // @match         https://discord.com/*
 // @grant         GM_getValue
 // @grant         GM_setValue
-// @run-at        document-start
+// @run-at        document-idle
 // @license       MIT
 // ==/UserScript==
 
@@ -15,10 +15,17 @@
  * 1. Install Tampermonkey or Violentmonkey
  * 2. Create a new script and paste this file
  * 3. Open Discord - a clock icon appears in the toolbar
- * 4. Click Get next to Auth Token and Author ID, then Save
+ * 4. Click Get next to Auth Token and Author ID, then Save settings
  * 5. Set a Global TTL in seconds (e.g. 3600 = 1 hour)
- * 6. Enable AutoDelete per-channel from the Channels tab
+ * 6. Enable AutoDelete per-channel from the Channels tab,
  *    or navigate to a channel and use the current channel toggle
+ *
+ * HOW IT WORKS:
+ * Instead of trying to intercept outgoing messages (unreliable due to
+ * Discord's bundler), this script periodically searches each enabled
+ * channel for messages sent by your account and deletes any that are
+ * older than the configured TTL. The check runs every 60 seconds and
+ * also fires when you switch back to the tab.
  */
 
 (function () {
@@ -27,13 +34,12 @@
     const KEY_TOKEN         = 'ad_token';
     const KEY_AUTHOR        = 'ad_authorId';
     const KEY_GLOBAL_TTL    = 'ad_globalTtl';
-    const KEY_ENABLED       = 'ad_enabled';
-    const KEY_CHANNEL_TTL   = 'ad_channelTtl';
-    const KEY_CHANNEL_NAMES = 'ad_channelNames';
-    const KEY_MSG_LOG       = 'ad_msgLog';
+    const KEY_ENABLED       = 'ad_enabled';       // { channelId: true/false }
+    const KEY_CHANNEL_TTL   = 'ad_channelTtl';    // { channelId: seconds }
+    const KEY_CHANNEL_NAMES = 'ad_channelNames';  // { channelId: label }
 
     const MAX_LOG_DISPLAY  = 300;
-    const TICK_INTERVAL_MS = 30_000;
+    const TICK_INTERVAL_MS = 60_000; // search + delete cycle runs every 60s
 
     // ── Storage ───────────────────────────────────────────────────────────────
     const store = {
@@ -44,46 +50,58 @@
         set: (key, val) => GM_setValue(key, JSON.stringify(val)),
     };
 
-    // ── fetch() hook — installed at document-start before Discord's JS runs ──
-    // Uses Object.defineProperty so Discord cannot clobber it by reassigning window.fetch.
-    const _origFetch = window.fetch.bind(window);
-
-    Object.defineProperty(window, 'fetch', {
-        configurable: true,
-        writable: true,
-        value: async function hookedFetch(input, init) {
-            const url    = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');
-            const method = ((init?.method) || (input instanceof Request ? input.method : '') || 'GET').toUpperCase();
-            const result = await _origFetch(input, init);
-
-            if (method === 'POST' && url && /\/api\/v\d+\/channels\/(\d+)\/messages$/.test(url) && result.ok) {
-                try {
-                    const data = await result.clone().json();
-                    if (data?.id && data?.channel_id) onMessageSent(data);
-                } catch { /* ignore */ }
-            }
-
-            return result;
-        }
-    });
-
-    // ── Keep-alive — stops browser from throttling background tab timers ──────
+    // ── Keep-alive ────────────────────────────────────────────────────────────
     const keepAlive = document.createElement('div');
     keepAlive.style.display = 'none';
-    document.addEventListener('DOMContentLoaded', () => document.body?.appendChild(keepAlive));
+    document.body.appendChild(keepAlive);
     setInterval(() => keepAlive.classList.toggle('ka'), 10_000);
 
-    // ── API ───────────────────────────────────────────────────────────────────
+    // ── API helpers ───────────────────────────────────────────────────────────
     const wait = ms => new Promise(r => setTimeout(r, ms));
+
+    // Search a channel for messages by authorId, returns array of message objects
+    async function searchMessages(authToken, authorId, channelId) {
+        // For DMs we use the channel search endpoint directly
+        const url = `https://discord.com/api/v9/channels/${channelId}/messages/search?author_id=${authorId}&limit=25`;
+        let retries = 3;
+        while (retries-- > 0) {
+            const r = await fetch(url, { headers: { Authorization: authToken } });
+            if (r.ok) {
+                const data = await r.json();
+                // The search endpoint returns { messages: [[...], [...]] } where each inner
+                // array is a context window — flatten and filter to just the author's hits
+                const messages = (data.messages || [])
+                    .flat()
+                    .filter(m => m.hit === true || m.author?.id === authorId);
+                return { ok: true, messages, total: data.total_results ?? messages.length };
+            }
+            if (r.status === 202) {
+                // Channel not indexed yet, wait and retry
+                let w = 2000;
+                try { const j = await r.json(); w = (j.retry_after ?? 2) * 1000; } catch {}
+                await wait(w);
+                continue;
+            }
+            if (r.status === 429) {
+                let w = 2000;
+                try { const j = await r.json(); w = ((j.retry_after ?? 2) * 1000) + 500; } catch {}
+                await wait(w);
+                continue;
+            }
+            // 403 = no access, 404 = channel gone — skip silently
+            return { ok: false, status: r.status, messages: [] };
+        }
+        return { ok: false, status: 'max_retries', messages: [] };
+    }
 
     async function deleteMessage(authToken, channelId, messageId) {
         let retries = 4;
         while (retries-- > 0) {
-            const r = await _origFetch(
+            const r = await fetch(
                 `https://discord.com/api/v9/channels/${channelId}/messages/${messageId}`,
                 { method: 'DELETE', headers: { Authorization: authToken } }
             );
-            if (r.ok || r.status === 404) return { ok: true, status: r.status };
+            if (r.ok || r.status === 404) return { ok: true };
             if (r.status === 429) {
                 let w = 1500;
                 try { const j = await r.json(); w = ((j.retry_after ?? 1) * 1000) + 500; } catch {}
@@ -95,90 +113,70 @@
         return { ok: false, status: 'max_retries' };
     }
 
-    // ── Message interceptor ───────────────────────────────────────────────────
-    function onMessageSent(msg) {
-        const channelId  = msg.channel_id;
-        const enabledMap = store.get(KEY_ENABLED, {});
-        if (!enabledMap[channelId]) return;
-
-        const ttlMap    = store.get(KEY_CHANNEL_TTL, {});
-        const globalTtl = store.get(KEY_GLOBAL_TTL, 3600);
-        const ttl       = ttlMap[channelId] ?? globalTtl;
-
-        // Best-effort: save channel name from page title
-        const names = store.get(KEY_CHANNEL_NAMES, {});
-        if (!names[channelId]) {
-            const label = document.title?.replace(' | Discord', '').trim();
-            if (label) { names[channelId] = label; store.set(KEY_CHANNEL_NAMES, names); }
-        }
-
-        const entry = {
-            id:       msg.id,
-            channelId,
-            content:  (msg.content || '').slice(0, 100),
-            ts:       Date.now(),
-            deleteAt: Date.now() + ttl * 1000,
-            ttl,
-        };
-
-        const log = store.get(KEY_MSG_LOG, []);
-        log.push(entry);
-        if (log.length > 5000) log.splice(0, log.length - 5000);
-        store.set(KEY_MSG_LOG, log);
-
-        addLog('success', `Logged: "${entry.content || '[attachment]'}" - deletes in ${formatDuration(ttl)}`);
-        refreshPendingCount();
-        renderChannelList();
-    }
-
-    // ── Ticker ────────────────────────────────────────────────────────────────
+    // ── Main tick — search each enabled channel, delete expired messages ───────
     let tickRunning = false;
+    let totalDeletedSession = 0;
 
     async function tick() {
         if (tickRunning) return;
+
+        const authToken = store.get(KEY_TOKEN, '');
+        const authorId  = store.get(KEY_AUTHOR, '');
+        if (!authToken || !authorId) return;
+
+        const enabledMap = store.get(KEY_ENABLED, {});
+        const channels   = Object.entries(enabledMap).filter(([, v]) => v).map(([id]) => id);
+        if (channels.length === 0) return;
+
         tickRunning = true;
+        updateStatus('Scanning...');
+
         try {
-            const authToken = store.get(KEY_TOKEN, '');
-            if (!authToken) return;
+            for (const channelId of channels) {
+                const ttlMap    = store.get(KEY_CHANNEL_TTL, {});
+                const globalTtl = store.get(KEY_GLOBAL_TTL, 3600);
+                const ttl       = (ttlMap[channelId] ?? globalTtl) * 1000; // ms
+                const cutoff    = Date.now() - ttl;
 
-            const now = Date.now();
-            let log   = store.get(KEY_MSG_LOG, []);
-            const due = log.filter(e => e.deleteAt <= now);
-            if (due.length === 0) return;
+                const { ok, messages, status } = await searchMessages(authToken, authorId, channelId);
 
-            addLog('info', `${due.length} message(s) due for deletion...`);
-
-            const failed = [];
-            for (const entry of due) {
-                const { ok, status } = await deleteMessage(authToken, entry.channelId, entry.id);
-                if (ok) {
-                    addLog('verb', `Deleted ${entry.id} (was: "${entry.content || '[attachment]'}")`);
-                } else if (status === 404) {
-                    addLog('verb', `Message ${entry.id} already gone.`);
-                } else {
-                    addLog('warn', `Failed to delete ${entry.id} (${status}), retrying next tick.`);
-                    failed.push(entry);
+                if (!ok) {
+                    if (status !== 403 && status !== 404) {
+                        addLog('warn', `Search failed for channel ${getChannelLabel(channelId)} (${status})`);
+                    }
+                    continue;
                 }
-                await wait(700);
-            }
 
-            const dueIds    = new Set(due.map(e => e.id));
-            const failedIds = new Set(failed.map(e => e.id));
-            log = log.filter(e => !dueIds.has(e.id) || failedIds.has(e.id));
-            store.set(KEY_MSG_LOG, log);
-            refreshPendingCount();
-            renderChannelList();
-            renderQueueList();
+                // Filter to messages older than TTL
+                const toDelete = messages.filter(m => {
+                    const ts = new Date(m.timestamp).getTime();
+                    return ts < cutoff && (m.type === 0 || m.type === 6);
+                });
+
+                if (toDelete.length === 0) continue;
+
+                addLog('info', `${getChannelLabel(channelId)}: ${toDelete.length} message(s) to delete`);
+
+                for (const msg of toDelete) {
+                    const { ok: delOk, status: delStatus } = await deleteMessage(authToken, channelId, msg.id);
+                    if (delOk) {
+                        totalDeletedSession++;
+                        addLog('verb', `Deleted: "${(msg.content || '[attachment]').slice(0, 60)}" from ${getChannelLabel(channelId)}`);
+                        updateTotalCounter();
+                    } else {
+                        addLog('warn', `Failed to delete ${msg.id} (${delStatus})`);
+                    }
+                    await wait(800);
+                }
+
+                await wait(500); // breathe between channels
+            }
         } finally {
             tickRunning = false;
+            updateStatus('Idle');
+            updateNextTick();
         }
     }
-
-    setInterval(tick, TICK_INTERVAL_MS);
-    setTimeout(tick, 3000);
-    document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') tick();
-    });
 
     // ── Utilities ─────────────────────────────────────────────────────────────
     function formatDuration(seconds) {
@@ -199,12 +197,41 @@
         return names[channelId] || `Channel ${channelId}`;
     }
 
+    function updateStatus(text) {
+        const el = document.querySelector('#dcad-status');
+        if (el) el.textContent = text;
+    }
+
+    function updateTotalCounter() {
+        const el = document.querySelector('#dcad-total');
+        if (el) el.textContent = totalDeletedSession.toLocaleString();
+    }
+
+    let nextTickSecs = TICK_INTERVAL_MS / 1000;
+    function updateNextTick() { nextTickSecs = TICK_INTERVAL_MS / 1000; }
+
+    setInterval(tick, TICK_INTERVAL_MS);
+    setTimeout(tick, 4000); // run shortly after load
+
+    // Re-run when tab becomes visible (catches up after backgrounding)
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') tick();
+    });
+
+    // Countdown
+    setInterval(() => {
+        nextTickSecs = Math.max(0, nextTickSecs - 1);
+        const el = document.querySelector('#dcad-next-tick');
+        if (el) el.textContent = tickRunning ? 'Running...' : `Next scan in ${nextTickSecs}s`;
+        if (nextTickSecs === 0 && !tickRunning) nextTickSecs = TICK_INTERVAL_MS / 1000;
+    }, 1000);
+
     // ── CSS ───────────────────────────────────────────────────────────────────
     const css = `
         #dcad-btn{position:relative;height:24px;width:auto;flex:0 0 auto;margin:0 8px;cursor:pointer;color:#b9bbbe;transition:color .15s;}
         #dcad-btn:hover{color:#fff;}
         #dcad-btn.active{color:#248046;}
-        #dcad{position:fixed;top:60px;right:10px;bottom:10px;width:620px;z-index:9999;color:#dcddde;background:#1e1f22;border:1px solid #111214;box-shadow:0 8px 32px rgba(0,0,0,.7);border-radius:8px;display:flex;flex-direction:column;font-family:'gg sans','Noto Sans',sans-serif;}
+        #dcad{position:fixed;top:60px;right:10px;bottom:10px;width:640px;z-index:9999;color:#dcddde;background:#1e1f22;border:1px solid #111214;box-shadow:0 8px 32px rgba(0,0,0,.7);border-radius:8px;display:flex;flex-direction:column;font-family:'gg sans','Noto Sans',sans-serif;}
         #dcad *{box-sizing:border-box;}
         #dcad .hdr{padding:12px 16px;background:#111214;border-radius:8px 8px 0 0;font-weight:700;font-size:14px;color:#fff;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #000;}
         #dcad .tabs{display:flex;background:#17181a;border-bottom:2px solid #111214;}
@@ -214,7 +241,7 @@
         #dcad .tab-panel{display:none;padding:12px;flex-direction:column;gap:8px;overflow-y:auto;}
         #dcad .tab-panel.active{display:flex;}
         #dcad input[type=password],#dcad input[type=text],#dcad input[type=number]{background:#111214;color:#dcddde;border:1px solid #2b2d31;border-radius:4px;padding:0 .6em;height:30px;width:180px;margin:2px;outline:none;font-size:13px;transition:border-color .15s;}
-        #dcad input[type=password]:focus,#dcad input[type=text]:focus,#dcad input[type=number]:focus{border-color:#5865f2;}
+        #dcad input:focus{border-color:#5865f2;}
         #dcad input::placeholder{color:#4e5058;}
         #dcad input[type=number]{width:90px;}
         #dcad button{color:#fff;background:#5865f2;border:0;border-radius:4px;padding:5px 14px;margin:2px;cursor:pointer;font-size:13px;font-weight:500;transition:filter .15s;}
@@ -239,21 +266,17 @@
         #dcad .ch-id{font-size:10px;color:#4e5058;font-family:monospace;}
         #dcad .ch-ttl-input{width:80px !important;height:26px !important;font-size:11px !important;}
         #dcad .ch-empty{color:#4e5058;font-size:12px;padding:20px;text-align:center;}
-        #dcad .pending-pill{background:#5865f2;color:#fff;font-size:10px;font-weight:700;padding:1px 7px;border-radius:10px;margin-left:4px;vertical-align:middle;}
+        #dcad .counter-pill{background:#248046;color:#fff;font-size:11px;font-weight:700;padding:2px 10px;border-radius:10px;}
         .dcad-info{color:#00b0f4}.dcad-warn{color:#faa61a}.dcad-error{color:#f04747}.dcad-success{color:#43b581}.dcad-verb{color:#555760}
     `;
 
-    function injectCSS() {
+    // ── UI ────────────────────────────────────────────────────────────────────
+    function initUI() {
         if (!document.getElementById('dcad-styles')) {
             document.head.appendChild(
                 Object.assign(document.createElement('style'), { id: 'dcad-styles', textContent: css })
             );
         }
-    }
-
-    // ── UI ────────────────────────────────────────────────────────────────────
-    function initUI() {
-        injectCSS();
 
         const panel = document.createElement('div');
         panel.id = 'dcad';
@@ -267,10 +290,10 @@
             <div class="tabs">
                 <div class="tab active" data-tab="settings">Settings</div>
                 <div class="tab" data-tab="channels">Channels</div>
-                <div class="tab" data-tab="queue">Queue <span class="pending-pill" id="dcad-pending-count">0</span></div>
                 <div class="tab" data-tab="log">Log</div>
             </div>
 
+            <!-- Settings -->
             <div class="tab-panel active" id="tab-settings">
                 <div class="section-title">Credentials</div>
                 <div class="field-row">
@@ -287,7 +310,7 @@
                 <div class="section-title">Global TTL</div>
                 <div class="field-row">
                     <span class="field-label">Seconds</span>
-                    <input type="number" id="dcad-global-ttl" min="30" step="60" value="3600">
+                    <input type="number" id="dcad-global-ttl" min="60" step="60" value="3600">
                     <span style="font-size:11px;color:#949ba4;" id="dcad-ttl-preview">= 1h</span>
                 </div>
                 <div style="font-size:11px;color:#4e5058;">Applied to all enabled channels unless a per-channel override is set.</div>
@@ -298,39 +321,43 @@
                     <span id="dcad-channel-id" style="font-size:11px;color:#4e5058;font-family:monospace;">none</span>
                     <span id="dcad-channel-badge" class="badge off">OFF</span>
                     <button id="dcad-toggle" class="success">Enable</button>
-                    <input type="number" class="ch-ttl-input" id="dcad-channel-ttl" min="30" step="60" placeholder="TTL (s)">
+                    <input type="number" class="ch-ttl-input" id="dcad-channel-ttl" min="60" step="60" placeholder="TTL (s)">
                     <span style="font-size:11px;color:#4e5058;">optional override</span>
+                </div>
+                <div style="font-size:11px;color:#4e5058;margin-top:2px;">
+                    The script scans enabled channels every 60 seconds and deletes your messages older than the TTL.
+                </div>
+                <hr>
+                <div style="display:flex;gap:6px;">
+                    <button id="dcad-scan-now" class="success small">Scan now</button>
                 </div>
             </div>
 
+            <!-- Channels -->
             <div class="tab-panel" id="tab-channels">
                 <div class="section-title">Enabled channels</div>
-                <div style="font-size:11px;color:#4e5058;margin-bottom:4px;">Edit TTL or disable any channel without navigating to it. Names are learned when you send a message or visit a channel.</div>
+                <div style="font-size:11px;color:#4e5058;margin-bottom:4px;">
+                    Edit TTL or disable any channel without navigating to it.
+                    Names are learned when you visit a channel or enable it.
+                </div>
                 <ul class="ch-list" id="dcad-ch-list"></ul>
                 <div class="ch-empty" id="dcad-ch-empty">No channels enabled yet.</div>
                 <hr>
                 <button id="dcad-disable-all" class="danger small" style="align-self:flex-start;">Disable all</button>
             </div>
 
-            <div class="tab-panel" id="tab-queue">
-                <div class="section-title">Pending deletions</div>
-                <div style="font-size:11px;color:#4e5058;margin-bottom:4px;">Messages scheduled for deletion, sorted by time remaining. Checked every 30s.</div>
-                <ul class="ch-list" id="dcad-queue-list"></ul>
-                <div class="ch-empty" id="dcad-queue-empty">Queue is empty.</div>
-                <hr>
-                <div style="display:flex;gap:6px;">
-                    <button id="dcad-tick-now" class="success small">Run check now</button>
-                    <button id="dcad-clear-queue" class="danger small">Clear queue</button>
-                </div>
-            </div>
-
+            <!-- Log -->
             <div class="tab-panel" id="tab-log" style="padding:0;flex-grow:1;min-height:0;">
-                <div class="log" id="dcad-log" style="flex-grow:1;border-radius:0;min-height:0;">AutoDelete v3.0 loaded.\n</div>
+                <div class="log" id="dcad-log" style="flex-grow:1;border-radius:0;min-height:0;">AutoDelete v4.0 loaded.\n</div>
             </div>
 
             <div class="status-bar">
                 <span id="dcad-status">Idle</span>
-                <span style="margin-left:auto;font-size:11px;" id="dcad-next-tick">Next check in 30s</span>
+                <span style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+                    <span style="font-size:11px;">Deleted this session:</span>
+                    <span class="counter-pill" id="dcad-total">0</span>
+                    <span style="font-size:11px;" id="dcad-next-tick">Next scan in 60s</span>
+                </span>
             </div>
         `;
         document.body.appendChild(panel);
@@ -356,7 +383,7 @@
 
         const logEl = panel.querySelector('#dcad-log');
 
-        window._dcadLog = function(type, msg) {
+        function addLogUI(type, msg) {
             const line = Object.assign(document.createElement('div'), {
                 className:   type ? `dcad-${type}` : '',
                 textContent: `[${new Date().toLocaleTimeString()}] ${msg}`,
@@ -364,14 +391,11 @@
             logEl.appendChild(line);
             while (logEl.children.length > MAX_LOG_DISPLAY) logEl.removeChild(logEl.firstChild);
             logEl.lastElementChild?.scrollIntoView(false);
-        };
+        }
+        // Make addLog available to the tick function
+        window._dcadLog = addLogUI;
 
-        window._dcadRefreshPending = function() {
-            const count = store.get(KEY_MSG_LOG, []).length;
-            panel.querySelector('#dcad-pending-count').textContent = count.toLocaleString();
-        };
-
-        window._dcadRenderChannelList = function() {
+        function renderChannelList() {
             const list       = panel.querySelector('#dcad-ch-list');
             const empty      = panel.querySelector('#dcad-ch-empty');
             const enabledMap = store.get(KEY_ENABLED, {});
@@ -395,7 +419,7 @@
                         <span class="ch-id">${channelId}</span>
                     </div>
                     <span style="font-size:11px;color:#949ba4;">TTL:</span>
-                    <input type="number" class="ch-ttl-input" value="${channelTtl ?? ''}" placeholder="${effectiveTtl}" min="30" step="60" data-id="${channelId}">
+                    <input type="number" class="ch-ttl-input" value="${channelTtl ?? ''}" placeholder="${effectiveTtl}" min="60" step="60" data-id="${channelId}">
                     <span style="font-size:11px;color:#4e5058;white-space:nowrap;">(${formatDuration(effectiveTtl)})</span>
                     <button class="small success ch-ttl-save" data-id="${channelId}">Save</button>
                     <button class="small danger ch-disable" data-id="${channelId}">Disable</button>
@@ -403,56 +427,22 @@
                 li.querySelector('.ch-ttl-save').onclick = () => {
                     const val = parseInt(li.querySelector(`input[data-id="${channelId}"]`).value);
                     const ttl = store.get(KEY_CHANNEL_TTL, {});
-                    if (val >= 30) { ttl[channelId] = val; } else { delete ttl[channelId]; }
+                    if (val >= 60) { ttl[channelId] = val; } else { delete ttl[channelId]; }
                     store.set(KEY_CHANNEL_TTL, ttl);
-                    addLog('success', `TTL for ${label}: ${val >= 30 ? formatDuration(val) : 'global default'}`);
-                    window._dcadRenderChannelList();
+                    addLogUI('success', `TTL for ${label}: ${val >= 60 ? formatDuration(val) : 'global default'}`);
+                    renderChannelList();
                 };
                 li.querySelector('.ch-disable').onclick = () => {
                     const em = store.get(KEY_ENABLED, {});
                     em[channelId] = false;
                     store.set(KEY_ENABLED, em);
-                    addLog('warn', `AutoDelete disabled for ${label}`);
-                    window._dcadRenderChannelList();
+                    addLogUI('warn', `AutoDelete disabled for ${label}`);
+                    renderChannelList();
                     refreshUI();
                 };
                 list.appendChild(li);
             }
-        };
-
-        window._dcadRenderQueueList = function() {
-            const list  = panel.querySelector('#dcad-queue-list');
-            const empty = panel.querySelector('#dcad-queue-empty');
-            const log   = store.get(KEY_MSG_LOG, []).slice().sort((a, b) => a.deleteAt - b.deleteAt);
-
-            list.innerHTML = '';
-            if (log.length === 0) { empty.style.display = ''; return; }
-            empty.style.display = 'none';
-
-            const now = Date.now();
-            for (const entry of log.slice(0, 200)) {
-                const remaining = Math.max(0, entry.deleteAt - now);
-                const label     = getChannelLabel(entry.channelId);
-                const li = document.createElement('li');
-                li.className = 'ch-row';
-                li.style.cssText = 'flex-direction:column;align-items:flex-start;gap:2px;';
-                li.innerHTML = `
-                    <div style="display:flex;width:100%;align-items:center;gap:8px;">
-                        <span style="font-size:12px;color:#dcddde;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">"${entry.content || '[attachment]'}"</span>
-                        <span style="font-size:10px;color:${remaining < 60000 ? '#faa61a' : '#4e5058'};white-space:nowrap;">
-                            ${remaining < 1000 ? 'deleting soon' : 'in ' + formatDuration(Math.round(remaining / 1000))}
-                        </span>
-                    </div>
-                    <div style="font-size:10px;color:#4e5058;">${label} | msg ${entry.id}</div>
-                `;
-                list.appendChild(li);
-            }
-            if (log.length > 200) {
-                const li = document.createElement('li');
-                li.innerHTML = `<span style="color:#4e5058;font-size:11px;padding:4px 8px;">...and ${log.length - 200} more</span>`;
-                list.appendChild(li);
-            }
-        };
+        }
 
         function refreshUI() {
             const channelId  = getCurrentChannelId();
@@ -480,18 +470,15 @@
             }
 
             btn.className = Object.values(enabledMap).some(Boolean) ? 'active' : '';
-            if (window._dcadRefreshPending) window._dcadRefreshPending();
         }
-        window._dcadRefreshUI = refreshUI;
 
-        // Tab switching
+        // Tabs
         panel.querySelectorAll('.tab').forEach(tab => {
             tab.onclick = () => {
                 panel.querySelectorAll('.tab,.tab-panel').forEach(el => el.classList.remove('active'));
                 tab.classList.add('active');
                 panel.querySelector(`#tab-${tab.dataset.tab}`).classList.add('active');
-                if (tab.dataset.tab === 'channels') window._dcadRenderChannelList();
-                if (tab.dataset.tab === 'queue')    window._dcadRenderQueueList();
+                if (tab.dataset.tab === 'channels') renderChannelList();
             };
         });
 
@@ -506,17 +493,45 @@
                 document.body.removeChild(iframe);
                 panel.querySelector('#dcad-token').value = token;
                 store.set(KEY_TOKEN, token);
-                addLog('success', 'Token saved.');
-            } catch { addLog('error', 'Could not auto-get token. Paste it manually.'); }
+                addLogUI('success', 'Token saved.');
+            } catch { addLogUI('error', 'Could not auto-get token. Paste it manually.'); }
         };
 
         panel.querySelector('#dcad-get-author').onclick = () => {
             try {
-                const id = JSON.parse(localStorage.user_id_cache);
-                panel.querySelector('#dcad-author').value = id;
-                store.set(KEY_AUTHOR, id);
-                addLog('success', 'Author ID saved.');
-            } catch { addLog('error', 'Could not auto-get author ID. Paste it manually.'); }
+                let id = null;
+
+                try { id = JSON.parse(localStorage.user_id_cache); } catch {}
+
+                if (!id) {
+                    try {
+                        const iframe = document.createElement('iframe');
+                        document.body.appendChild(iframe);
+                        const token = JSON.parse(iframe.contentWindow.localStorage.token || localStorage.token);
+                        document.body.removeChild(iframe);
+                        const decoded = atob(token.split('.')[0]);
+                        if (/^\d+$/.test(decoded)) id = decoded;
+                    } catch {}
+                }
+
+                if (!id) {
+                    try {
+                        const wpStore = window.webpackChunkdiscord_app?.push?.([[Symbol()], {}, r => r]);
+                        if (wpStore) {
+                            const mod = Object.values(wpStore.c || {}).find(m => m?.exports?.default?.getCurrentUser);
+                            id = mod?.exports?.default?.getCurrentUser?.()?.id;
+                        }
+                    } catch {}
+                }
+
+                if (id) {
+                    panel.querySelector('#dcad-author').value = id;
+                    store.set(KEY_AUTHOR, id);
+                    addLogUI('success', `Author ID found: ${id}`);
+                } else {
+                    addLogUI('error', 'Could not auto-get author ID. Paste it manually.');
+                }
+            } catch { addLogUI('error', 'Could not auto-get author ID. Paste it manually.'); }
         };
 
         panel.querySelector('#dcad-global-ttl').oninput = function () {
@@ -529,14 +544,14 @@
             const ttl    = parseInt(panel.querySelector('#dcad-global-ttl').value);
             if (token)     store.set(KEY_TOKEN, token);
             if (author)    store.set(KEY_AUTHOR, author);
-            if (ttl >= 30) store.set(KEY_GLOBAL_TTL, ttl);
-            addLog('success', `Saved. Global TTL: ${formatDuration(ttl)}`);
+            if (ttl >= 60) store.set(KEY_GLOBAL_TTL, ttl);
+            addLogUI('success', `Saved. Global TTL: ${formatDuration(ttl)}`);
             refreshUI();
         };
 
         panel.querySelector('#dcad-toggle').onclick = () => {
             const channelId = getCurrentChannelId();
-            if (!channelId) { addLog('warn', 'Navigate to a channel first.'); return; }
+            if (!channelId) { addLogUI('warn', 'Navigate to a channel first.'); return; }
 
             const enabledMap      = store.get(KEY_ENABLED, {});
             const ttlMap          = store.get(KEY_CHANNEL_TTL, {});
@@ -546,11 +561,12 @@
             enabledMap[channelId] = nowOn;
             store.set(KEY_ENABLED, enabledMap);
 
-            if (channelTtlInput >= 30) {
+            if (channelTtlInput >= 60) {
                 ttlMap[channelId] = channelTtlInput;
                 store.set(KEY_CHANNEL_TTL, ttlMap);
             }
 
+            // Save channel name from page title
             const names = store.get(KEY_CHANNEL_NAMES, {});
             if (!names[channelId]) {
                 const label = document.title?.replace(' | Discord', '').trim() || `Channel ${channelId}`;
@@ -559,57 +575,37 @@
             }
 
             const effectiveTtl = ttlMap[channelId] ?? store.get(KEY_GLOBAL_TTL, 3600);
-            addLog(nowOn ? 'success' : 'warn',
+            addLogUI(nowOn ? 'success' : 'warn',
                 nowOn
                     ? `AutoDelete ON for ${getChannelLabel(channelId)} - TTL: ${formatDuration(effectiveTtl)}`
                     : `AutoDelete OFF for ${getChannelLabel(channelId)}`
             );
             refreshUI();
-            window._dcadRenderChannelList();
+            renderChannelList();
         };
 
         panel.querySelector('#dcad-disable-all').onclick = () => {
             if (!window.confirm('Disable AutoDelete for all channels?')) return;
             store.set(KEY_ENABLED, {});
-            addLog('warn', 'AutoDelete disabled for all channels.');
+            addLogUI('warn', 'AutoDelete disabled for all channels.');
             refreshUI();
-            window._dcadRenderChannelList();
+            renderChannelList();
         };
 
-        panel.querySelector('#dcad-tick-now').onclick = () => {
-            addLog('info', 'Running deletion check manually...');
-            tick().then(() => window._dcadRenderQueueList());
-        };
-
-        panel.querySelector('#dcad-clear-queue').onclick = () => {
-            if (!window.confirm('Clear the pending queue? Messages will NOT be deleted.')) return;
-            store.set(KEY_MSG_LOG, []);
-            addLog('warn', 'Queue cleared.');
-            if (window._dcadRefreshPending) window._dcadRefreshPending();
-            window._dcadRenderQueueList();
+        panel.querySelector('#dcad-scan-now').onclick = () => {
+            addLogUI('info', 'Manual scan triggered...');
+            tick();
         };
 
         new MutationObserver(refreshUI)
             .observe(document.querySelector('title') || document.head, { childList: true, subtree: true });
 
         refreshUI();
-        addLog('info', 'AutoDelete v3.0 ready. Set credentials in Settings, then enable channels.');
+        addLogUI('info', 'AutoDelete v4.0 ready. Set credentials in Settings, then enable channels.');
     }
 
-    // ── Shims so hook can call UI functions before UI is built ────────────────
-    function addLog(type, msg)    { if (window._dcadLog)            window._dcadLog(type, msg); }
-    function refreshPendingCount(){ if (window._dcadRefreshPending) window._dcadRefreshPending(); }
-    function renderChannelList()  { if (window._dcadRenderChannelList) window._dcadRenderChannelList(); }
-    function renderQueueList()    { if (window._dcadRenderQueueList)   window._dcadRenderQueueList(); }
-
-    // ── Countdown ticker in status bar ────────────────────────────────────────
-    let nextTickIn = TICK_INTERVAL_MS / 1000;
-    setInterval(() => {
-        nextTickIn = Math.max(0, nextTickIn - 1);
-        const el = document.querySelector('#dcad-next-tick');
-        if (el) el.textContent = `Next check in ${nextTickIn}s`;
-        if (nextTickIn === 0) nextTickIn = TICK_INTERVAL_MS / 1000;
-    }, 1000);
+    // addLog shim — works before UI is built, routes to UI once it exists
+    function addLog(type, msg) { if (window._dcadLog) window._dcadLog(type, msg); }
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', initUI);
