@@ -62,43 +62,40 @@
     // ── API helpers ───────────────────────────────────────────────────────────
     const wait = ms => new Promise(r => setTimeout(r, ms));
 
-    // Search a channel for messages by authorId, returns array of message objects
-    async function searchMessages(authToken, authorId, channelId) {
-        // For DMs we use the channel search endpoint directly
-        const url = `https://discord.com/api/v9/channels/${channelId}/messages/search?author_id=${authorId}&limit=25`;
-        let retries = 3;
+    // Search a channel for messages by authorId with offset, returns array of message objects
+    async function searchMessages(authToken, authorId, channelId, offset) {
+        const url = `https://discord.com/api/v9/channels/${channelId}/messages/search?author_id=${authorId}&sort_by=timestamp&sort_order=desc&offset=${offset}&limit=25`;
+        let retries = 5;
         while (retries-- > 0) {
             const r = await fetch(url, { headers: { Authorization: authToken } });
             if (r.ok) {
                 const data = await r.json();
-                // The search endpoint returns { messages: [[...], [...]] } where each inner
-                // array is a context window — flatten and filter to just the author's hits
                 const messages = (data.messages || [])
                     .flat()
                     .filter(m => m.hit === true || m.author?.id === authorId);
-                return { ok: true, messages, total: data.total_results ?? messages.length };
+                return { ok: true, messages, total: data.total_results ?? 0 };
             }
             if (r.status === 202) {
-                // Channel not indexed yet, wait and retry
                 let w = 2000;
                 try { const j = await r.json(); w = (j.retry_after ?? 2) * 1000; } catch {}
+                addLog('verb', `Channel ${getChannelLabel(channelId)} not indexed, waiting ${Math.round(w / 1000)}s...`);
                 await wait(w);
                 continue;
             }
             if (r.status === 429) {
                 let w = 2000;
                 try { const j = await r.json(); w = ((j.retry_after ?? 2) * 1000) + 500; } catch {}
+                addLog('warn', `Rate limited on search, cooling ${Math.round(w / 1000)}s...`);
                 await wait(w);
                 continue;
             }
-            // 403 = no access, 404 = channel gone — skip silently
-            return { ok: false, status: r.status, messages: [] };
+            return { ok: false, status: r.status, messages: [], total: 0 };
         }
-        return { ok: false, status: 'max_retries', messages: [] };
+        return { ok: false, status: 'max_retries', messages: [], total: 0 };
     }
 
     async function deleteMessage(authToken, channelId, messageId) {
-        let retries = 4;
+        let retries = 5;
         while (retries-- > 0) {
             const r = await fetch(
                 `https://discord.com/api/v9/channels/${channelId}/messages/${messageId}`,
@@ -108,6 +105,7 @@
             if (r.status === 429) {
                 let w = 1500;
                 try { const j = await r.json(); w = ((j.retry_after ?? 1) * 1000) + 500; } catch {}
+                addLog('warn', `Rate limited on delete, cooling ${Math.round(w / 1000)}s...`);
                 await wait(w);
                 continue;
             }
@@ -116,7 +114,77 @@
         return { ok: false, status: 'max_retries' };
     }
 
-    // ── Main tick — search each enabled channel, delete expired messages ───────
+    // Delete all expired messages in a single channel, re-searching until none remain
+    async function purgeChannel(authToken, authorId, channelId, cutoff) {
+        let deleteDelay = 1200;
+        let searchDelay = 1500;
+        let offset = 0;
+        let deleted = 0;
+        let failed = 0;
+
+        while (true) {
+            const { ok, messages, total, status } = await searchMessages(authToken, authorId, channelId, offset);
+
+            if (!ok) {
+                if (status !== 403 && status !== 404) {
+                    addLog('warn', `Search failed for ${getChannelLabel(channelId)} (${status})`);
+                }
+                break;
+            }
+
+            const toDelete = messages.filter(m => {
+                const ts = new Date(m.timestamp).getTime();
+                return ts < cutoff && (m.type === 0 || m.type === 6);
+            });
+
+            // No expired messages in this page
+            if (toDelete.length === 0) {
+                // But there may be more pages of non-expired messages -- stop here,
+                // they are newer so no point paging further (sorted desc by timestamp)
+                break;
+            }
+
+            const skipped = messages.length - toDelete.length;
+
+            for (const msg of toDelete) {
+                const { ok: delOk, status: delStatus } = await deleteMessage(authToken, channelId, msg.id);
+                if (delOk) {
+                    deleted++;
+                    totalDeletedSession++;
+                    addLog('verb', `Deleted: "${(msg.content || '[attachment]').slice(0, 60)}" from ${getChannelLabel(channelId)}`);
+                    updateTotalCounter();
+
+                    // Log to history
+                    const hist = store.get(KEY_MSG_HISTORY, []);
+                    hist.unshift({ id: msg.id, channelId, content: (msg.content || '').slice(0, 100), deletedAt: Date.now() });
+                    if (hist.length > 500) hist.splice(500);
+                    store.set(KEY_MSG_HISTORY, hist);
+
+                    // Adaptive: speed up slightly every 50 deletes (floor 600ms)
+                    if (deleted % 50 === 0) deleteDelay = Math.max(600, deleteDelay - 50);
+                } else {
+                    addLog('warn', `Failed to delete ${msg.id} (${delStatus})`);
+                    failed++;
+                    offset++; // skip past it on next search
+                    // Back off on persistent failures
+                    deleteDelay = Math.min(5000, deleteDelay + 200);
+                }
+                await wait(deleteDelay);
+            }
+
+            // If we skipped non-expired messages, bump offset so next search page starts past them
+            if (skipped > 0) offset += skipped;
+
+            // Check if there could be more results
+            if (total <= offset + toDelete.length + skipped && total <= 25) break;
+
+            await wait(searchDelay);
+        }
+
+        return { deleted, failed };
+    }
+
+    // ── Main tick -- search each enabled channel, delete expired messages ───────
     let tickRunning = false;
     let totalDeletedSession = 0;
 
@@ -141,42 +209,12 @@
                 const ttl       = (ttlMap[channelId] ?? globalTtl) * 1000; // ms
                 const cutoff    = Date.now() - ttl;
 
-                const { ok, messages, status } = await searchMessages(authToken, authorId, channelId);
+                updateStatus(`Scanning ${getChannelLabel(channelId)}...`);
+                const { deleted, failed } = await purgeChannel(authToken, authorId, channelId, cutoff);
 
-                if (!ok) {
-                    if (status !== 403 && status !== 404) {
-                        addLog('warn', `Search failed for channel ${getChannelLabel(channelId)} (${status})`);
-                    }
-                    continue;
-                }
-
-                // Filter to messages older than TTL
-                // m.timestamp is an ISO 8601 string from Discord's API e.g. '2024-01-15T02:22:00.000000+00:00'
-                const toDelete = messages.filter(m => {
-                    const ts = new Date(m.timestamp).getTime();
-                    return ts < cutoff && (m.type === 0 || m.type === 6);
-                });
-
-                if (toDelete.length === 0) continue;
-
-                addLog('info', `${getChannelLabel(channelId)}: ${toDelete.length} message(s) to delete`);
-
-                for (const msg of toDelete) {
-                    const { ok: delOk, status: delStatus } = await deleteMessage(authToken, channelId, msg.id);
-                    if (delOk) {
-                        totalDeletedSession++;
-                        addLog('verb', `Deleted: "${(msg.content || '[attachment]').slice(0, 60)}" from ${getChannelLabel(channelId)}`);
-                        updateTotalCounter();
-                        // Log to history
-                        const hist = store.get(KEY_MSG_HISTORY, []);
-                        hist.unshift({ id: msg.id, channelId, content: (msg.content || '').slice(0, 100), deletedAt: Date.now() });
-                        if (hist.length > 500) hist.splice(500);
-                        store.set(KEY_MSG_HISTORY, hist);
-                        renderHistoryList();
-                    } else {
-                        addLog('warn', `Failed to delete ${msg.id} (${delStatus})`);
-                    }
-                    await wait(800);
+                if (deleted > 0 || failed > 0) {
+                    addLog('info', `${getChannelLabel(channelId)}: deleted ${deleted}, failed ${failed}`);
+                    renderHistoryList();
                 }
 
                 await wait(500); // breathe between channels
@@ -696,7 +734,7 @@
         addLogUI('info', 'AutoDelete v4.1 ready. Set credentials in Settings, then enable channels.');
     }
 
-    // addLog shim — works before UI is built, routes to UI once it exists
+    // addLog shim - works before UI is built, routes to UI once it exists
     function addLog(type, msg) { if (window._dcadLog) window._dcadLog(type, msg); }
 
     if (document.readyState === 'loading') {
