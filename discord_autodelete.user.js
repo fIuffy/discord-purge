@@ -504,19 +504,21 @@
             }
         }
 
-        function refreshUI() {
+        function refreshUI(skipSettings) {
             const channelId  = getCurrentChannelId();
             const enabledMap = store.get(KEY_ENABLED, {});
             const ttlMap     = store.get(KEY_CHANNEL_TTL, {});
             const globalTtl  = store.get(KEY_GLOBAL_TTL, 3600);
 
-            panel.querySelector('#dcad-token').value      = store.get(KEY_TOKEN, '');
-            panel.querySelector('#dcad-author').value     = store.get(KEY_AUTHOR, '');
-            panel.querySelector('#dcad-global-ttl').value = globalTtl;
-            panel.querySelector('#dcad-ttl-preview').textContent = `= ${formatDuration(globalTtl)}`;
-            const scanSecs = store.get(KEY_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL);
-            panel.querySelector('#dcad-scan-interval').value = scanSecs;
-            panel.querySelector('#dcad-interval-preview').textContent = `= ${formatDuration(scanSecs)}`;
+            if (!skipSettings) {
+                panel.querySelector('#dcad-token').value      = store.get(KEY_TOKEN, '');
+                panel.querySelector('#dcad-author').value     = store.get(KEY_AUTHOR, '');
+                panel.querySelector('#dcad-global-ttl').value = globalTtl;
+                panel.querySelector('#dcad-ttl-preview').textContent = `= ${formatDuration(globalTtl)}`;
+                const scanSecs = store.get(KEY_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL);
+                panel.querySelector('#dcad-scan-interval').value = scanSecs;
+                panel.querySelector('#dcad-interval-preview').textContent = `= ${formatDuration(scanSecs)}`;
+            }
 
             if (channelId) {
                 panel.querySelector('#dcad-channel-id').textContent = channelId;
@@ -627,9 +629,9 @@
             const savedScan = scanSecs >= 30 ? scanSecs : store.get(KEY_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL);
             addLogUI('success', `Saved. TTL: ${formatDuration(savedTtl)}, scan every: ${formatDuration(savedScan)}`);
 
-            // Yield so any remaining async GM writes flush, then refresh non-settings UI
+            // Yield so any remaining async GM writes flush, then refresh non-settings UI only
             await new Promise(r => setTimeout(r, 50));
-            refreshUI();
+            refreshUI(true);
         };
 
         panel.querySelector('#dcad-toggle').onclick = async () => {
