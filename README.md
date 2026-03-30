@@ -106,9 +106,10 @@ Periodically searches each enabled channel for messages you have sent and delete
 
 ### The panel
 
-- **Settings** - credentials, global TTL, quick toggle for the current channel, and a manual scan button
+- **Settings** - credentials, global TTL, scan interval, quick toggle for the current channel, and a manual scan button
 - **Channels** - list of every enabled channel with inline TTL editing and a disable button, no navigating required
-- **Log** - event log for every scan, deletion, and error
+- **History** - log of every message deleted, with content preview, channel name, and timestamp. Persists across sessions up to 500 entries.
+- **Log** - live event log for scans, deletions, and errors
 
 ### TTL reference
 
@@ -121,11 +122,14 @@ Periodically searches each enabled channel for messages you have sent and delete
 ### How it works
 
 ```
-Every 60 seconds (or when you switch back to the tab):
+Every N seconds (your configured scan interval, default 60):
        |
 Search each enabled channel for messages by your account
        |
-Any message older than the TTL gets a DELETE request
+For each result, extract the creation timestamp from the message's snowflake ID
+(upper 42 bits, offset from Discord epoch 2015-01-01 — no string parsing)
+       |
+If (now - snowflake_timestamp) > TTL, delete the message
        |
 Failed deletes are retried on the next scan
 ```
