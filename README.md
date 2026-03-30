@@ -91,7 +91,7 @@ The script handles rate limit responses automatically - it backs off when Discor
 
 ## Script 2 - AutoDelete (expiring messages)
 
-Periodically searches each enabled channel for messages you have sent and deletes any that are older than the configured TTL. Runs every 60 seconds in the background, and also fires immediately when you switch back to the tab.
+Periodically searches each enabled channel for messages you have sent and deletes any that are older than the configured TTL. Each scan fully drains expired messages per channel - it loops through paginated search results and deletes everything that has aged out, not just one page worth. Runs every 60 seconds in the background by default, and also fires immediately when you switch back to the tab.
 
 **Requires Tampermonkey or Violentmonkey** for persistent storage.
 
@@ -124,14 +124,18 @@ Periodically searches each enabled channel for messages you have sent and delete
 ```
 Every N seconds (your configured scan interval, default 60):
        |
-Search each enabled channel for messages by your account
+For each enabled channel:
        |
-For each result, extract the creation timestamp from the message's snowflake ID
-(upper 42 bits, offset from Discord epoch 2015-01-01 — no string parsing)
+  Search for messages by your account (paginated, 25 per page)
        |
-If (now - snowflake_timestamp) > TTL, delete the message
+  For each result, compare the message timestamp against the TTL cutoff
        |
-Failed deletes are retried on the next scan
+  If (now - message_timestamp) > TTL, delete the message
+       |
+  Re-search and repeat until no expired messages remain in that channel
+       |
+  Adaptive rate limiting: starts at ~1.2s per delete, speeds up gradually
+  on sustained success, backs off automatically on failures or 429s
 ```
 
 Your token is only ever stored in Tampermonkey's local storage on your own machine. It is never sent anywhere except Discord's own API.
