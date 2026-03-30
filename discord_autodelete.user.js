@@ -547,7 +547,7 @@
 
         panel.querySelector('#dcad-close').onclick = () => { panel.style.display = 'none'; };
 
-        panel.querySelector('#dcad-get-token').onclick = () => {
+        panel.querySelector('#dcad-get-token').onclick = async () => {
             try {
                 window.dispatchEvent(new Event('beforeunload'));
                 const iframe = document.createElement('iframe');
@@ -555,7 +555,7 @@
                 const token = JSON.parse(iframe.contentWindow.localStorage.token || localStorage.token);
                 document.body.removeChild(iframe);
                 panel.querySelector('#dcad-token').value = token;
-                store.set(KEY_TOKEN, token);
+                await Promise.resolve(store.set(KEY_TOKEN, token));
                 addLogUI('success', 'Token saved.');
             } catch { addLogUI('error', 'Could not auto-get token. Paste it manually.'); }
         };
@@ -589,7 +589,7 @@
 
                 if (id) {
                     panel.querySelector('#dcad-author').value = id;
-                    store.set(KEY_AUTHOR, id);
+                    await Promise.resolve(store.set(KEY_AUTHOR, id));
                     addLogUI('success', `Author ID found: ${id}`);
                 } else {
                     addLogUI('error', 'Could not auto-get author ID. Paste it manually.');
@@ -605,22 +605,27 @@
             panel.querySelector('#dcad-interval-preview').textContent = `= ${formatDuration(parseInt(this.value) || 0)}`;
         };
 
-        panel.querySelector('#dcad-save-global').onclick = () => {
-            const token  = panel.querySelector('#dcad-token').value.trim();
-            const author = panel.querySelector('#dcad-author').value.trim();
-            const ttl    = parseInt(panel.querySelector('#dcad-global-ttl').value);
+        panel.querySelector('#dcad-save-global').onclick = async () => {
+            const token    = panel.querySelector('#dcad-token').value.trim();
+            const author   = panel.querySelector('#dcad-author').value.trim();
+            const ttl      = parseInt(panel.querySelector('#dcad-global-ttl').value);
             const scanSecs = parseInt(panel.querySelector('#dcad-scan-interval').value);
-            if (token)          store.set(KEY_TOKEN, token);
-            if (author)         store.set(KEY_AUTHOR, author);
-            if (ttl >= 60)      store.set(KEY_GLOBAL_TTL, ttl);
+
+            // Write all values first, await each so GM storage has settled before we read back
+            if (token)          await Promise.resolve(store.set(KEY_TOKEN, token));
+            if (author)         await Promise.resolve(store.set(KEY_AUTHOR, author));
+            if (ttl >= 60)      await Promise.resolve(store.set(KEY_GLOBAL_TTL, ttl));
             if (scanSecs >= 30) {
-                store.set(KEY_SCAN_INTERVAL, scanSecs);
-                // Restart the interval with new timing
+                await Promise.resolve(store.set(KEY_SCAN_INTERVAL, scanSecs));
                 clearInterval(tickInterval);
                 tickInterval = setInterval(tick, getTickMs());
                 nextTickSecs = getTickMs() / 1000;
             }
-            addLogUI('success', `Saved. TTL: ${formatDuration(ttl)}, scan every: ${formatDuration(scanSecs)}`);
+
+            addLogUI('success', `Saved. TTL: ${formatDuration(ttl || store.get(KEY_GLOBAL_TTL, 3600))}, scan every: ${formatDuration(scanSecs >= 30 ? scanSecs : store.get(KEY_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))}`);
+
+            // Small yield so any async GM writes can flush before refreshUI reads them back
+            await new Promise(r => setTimeout(r, 50));
             refreshUI();
         };
 
