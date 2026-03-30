@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          Discord Full Account Purge
 // @description   Automatically deletes all your messages across all DMs, Group DMs, and Servers. Supports Discord data package import and channel exclusion lists.
-// @namespace     https://github.com/YOUR_USERNAME/discord-purge
+// @namespace     https://github.com/fIuffy/discord-purge
 // @version       3.0
 // @match         https://discord.com/*
 // @grant         GM_getValue
