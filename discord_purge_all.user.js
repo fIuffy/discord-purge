@@ -164,26 +164,50 @@
 
         // 2. Friends list — open (or re-open) a DM with each friend to get its channel ID.
         //    This catches DMs that have been closed/hidden from the sidebar but still exist.
+        //    Old/dormant DMs can be throttled harder by Discord, so we retry on 429 and
+        //    validate the response shape before using it.
         try {
             const r = await fetch('https://discord.com/api/v9/users/@me/relationships', { headers });
             if (r.ok) {
                 const relationships = await r.json();
-                // type 1 = friend
                 const friends = relationships.filter(rel => rel.type === 1);
                 for (const friend of friends) {
-                    try {
-                        // POST to create/reopen a DM — safe, just returns the channel object
-                        const dr = await fetch('https://discord.com/api/v9/users/@me/channels', {
-                            method: 'POST',
-                            headers: { ...headers, 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ recipient_id: friend.id }),
-                        });
-                        if (dr.ok) {
-                            const dm = await dr.json();
-                            pushChannel({ guildId:'@me', channelId:dm.id, label:`DM with ${friend.user?.username ?? friend.id}`, source:'live' });
+                    const friendId = friend.id ?? friend.user?.id;
+                    const friendName = friend.user?.username ?? friend.user?.global_name ?? friendId;
+                    if (!friendId) continue;
+
+                    let attempts = 3;
+                    while (attempts-- > 0) {
+                        try {
+                            const dr = await fetch('https://discord.com/api/v9/users/@me/channels', {
+                                method: 'POST',
+                                headers: { ...headers, 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ recipient_id: friendId }),
+                            });
+
+                            if (dr.status === 429) {
+                                // respect retry_after before trying again
+                                let retryAfter = 1000;
+                                try { const j = await dr.json(); retryAfter = ((j.retry_after ?? 1) * 1000) + 500; } catch {}
+                                await new Promise(r => setTimeout(r, retryAfter));
+                                continue; // retry
+                            }
+
+                            if (dr.ok) {
+                                const dm = await dr.json();
+                                // validate we actually got a channel object with an id
+                                if (dm && typeof dm.id === 'string' && dm.id.length > 0) {
+                                    pushChannel({ guildId:'@me', channelId:dm.id, label:`DM with ${friendName}`, source:'live' });
+                                }
+                            }
+                            break; // success or unrecoverable error, stop retrying
+                        } catch(e) {
+                            console.warn(`Could not open DM for friend ${friendName} (${friendId}):`, e);
+                            break;
                         }
-                    } catch(e) { console.warn(`Could not open DM for friend ${friend.id}:`, e); }
-                    await new Promise(r => setTimeout(r, 200));
+                    }
+                    // space requests out enough to avoid sustained throttling on large friends lists
+                    await new Promise(r => setTimeout(r, 350));
                 }
             }
         } catch(e) { console.warn('Could not fetch friends list:',e); }
