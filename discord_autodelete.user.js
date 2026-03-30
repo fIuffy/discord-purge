@@ -150,9 +150,15 @@
                     continue;
                 }
 
+                // Extract timestamp directly from the snowflake ID.
+                // Discord snowflakes: upper 42 bits = ms since Discord epoch (2015-01-01).
+                // Using BigInt to avoid float precision loss on 64-bit IDs.
+                const DISCORD_EPOCH = 1420070400000n;
+                const snowflakeToMs = id => Number((BigInt(id) >> 22n) + DISCORD_EPOCH);
+
                 // Filter to messages older than TTL
                 const toDelete = messages.filter(m => {
-                    const ts = new Date(m.timestamp).getTime();
+                    const ts = snowflakeToMs(m.id);
                     return ts < cutoff && (m.type === 0 || m.type === 6);
                 });
 
