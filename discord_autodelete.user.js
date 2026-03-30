@@ -50,7 +50,7 @@
             try { const v = GM_getValue(key); return v === undefined ? def : JSON.parse(v); }
             catch { return def; }
         },
-        set: (key, val) => GM_setValue(key, JSON.stringify(val)),
+        set: async (key, val) => { await GM_setValue(key, JSON.stringify(val)); },
     };
 
     // ── Keep-alive ────────────────────────────────────────────────────────────
@@ -454,18 +454,18 @@
                     <button class="small success ch-ttl-save" data-id="${channelId}">Save</button>
                     <button class="small danger ch-disable" data-id="${channelId}">Disable</button>
                 `;
-                li.querySelector('.ch-ttl-save').onclick = () => {
+                li.querySelector('.ch-ttl-save').onclick = async () => {
                     const val = parseInt(li.querySelector(`input[data-id="${channelId}"]`).value);
                     const ttl = store.get(KEY_CHANNEL_TTL, {});
                     if (val >= 60) { ttl[channelId] = val; } else { delete ttl[channelId]; }
-                    store.set(KEY_CHANNEL_TTL, ttl);
+                    await store.set(KEY_CHANNEL_TTL, ttl);
                     addLogUI('success', `TTL for ${label}: ${val >= 60 ? formatDuration(val) : 'global default'}`);
                     renderChannelList();
                 };
-                li.querySelector('.ch-disable').onclick = () => {
+                li.querySelector('.ch-disable').onclick = async () => {
                     const em = store.get(KEY_ENABLED, {});
                     em[channelId] = false;
-                    store.set(KEY_ENABLED, em);
+                    await store.set(KEY_ENABLED, em);
                     addLogUI('warn', `AutoDelete disabled for ${label}`);
                     renderChannelList();
                     refreshUI();
@@ -556,7 +556,7 @@
                 const token = JSON.parse(iframe.contentWindow.localStorage.token || localStorage.token);
                 document.body.removeChild(iframe);
                 panel.querySelector('#dcad-token').value = token;
-                await Promise.resolve(store.set(KEY_TOKEN, token));
+                await store.set(KEY_TOKEN, token);
                 addLogUI('success', 'Token saved.');
             } catch { addLogUI('error', 'Could not auto-get token. Paste it manually.'); }
         };
@@ -590,7 +590,7 @@
 
                 if (id) {
                     panel.querySelector('#dcad-author').value = id;
-                    await Promise.resolve(store.set(KEY_AUTHOR, id));
+                    await store.set(KEY_AUTHOR, id);
                     addLogUI('success', `Author ID found: ${id}`);
                 } else {
                     addLogUI('error', 'Could not auto-get author ID. Paste it manually.');
@@ -612,25 +612,27 @@
             const ttl      = parseInt(panel.querySelector('#dcad-global-ttl').value);
             const scanSecs = parseInt(panel.querySelector('#dcad-scan-interval').value);
 
-            // Write all values first, await each so GM storage has settled before we read back
-            if (token)          await Promise.resolve(store.set(KEY_TOKEN, token));
-            if (author)         await Promise.resolve(store.set(KEY_AUTHOR, author));
-            if (ttl >= 60)      await Promise.resolve(store.set(KEY_GLOBAL_TTL, ttl));
+            // Await each write so GM storage has settled before anything reads back
+            if (token)          await store.set(KEY_TOKEN, token);
+            if (author)         await store.set(KEY_AUTHOR, author);
+            if (ttl >= 60)      await store.set(KEY_GLOBAL_TTL, ttl);
             if (scanSecs >= 30) {
-                await Promise.resolve(store.set(KEY_SCAN_INTERVAL, scanSecs));
+                await store.set(KEY_SCAN_INTERVAL, scanSecs);
                 clearInterval(tickInterval);
                 tickInterval = setInterval(tick, getTickMs());
                 nextTickSecs = getTickMs() / 1000;
             }
 
-            addLogUI('success', `Saved. TTL: ${formatDuration(ttl || store.get(KEY_GLOBAL_TTL, 3600))}, scan every: ${formatDuration(scanSecs >= 30 ? scanSecs : store.get(KEY_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))}`);
+            const savedTtl  = ttl >= 60 ? ttl : store.get(KEY_GLOBAL_TTL, 3600);
+            const savedScan = scanSecs >= 30 ? scanSecs : store.get(KEY_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL);
+            addLogUI('success', `Saved. TTL: ${formatDuration(savedTtl)}, scan every: ${formatDuration(savedScan)}`);
 
-            // Small yield so any async GM writes can flush before refreshUI reads them back
+            // Yield so any remaining async GM writes flush, then refresh non-settings UI
             await new Promise(r => setTimeout(r, 50));
             refreshUI();
         };
 
-        panel.querySelector('#dcad-toggle').onclick = () => {
+        panel.querySelector('#dcad-toggle').onclick = async () => {
             const channelId = getCurrentChannelId();
             if (!channelId) { addLogUI('warn', 'Navigate to a channel first.'); return; }
 
@@ -640,11 +642,11 @@
             const nowOn           = !enabledMap[channelId];
 
             enabledMap[channelId] = nowOn;
-            store.set(KEY_ENABLED, enabledMap);
+            await store.set(KEY_ENABLED, enabledMap);
 
             if (channelTtlInput >= 60) {
                 ttlMap[channelId] = channelTtlInput;
-                store.set(KEY_CHANNEL_TTL, ttlMap);
+                await store.set(KEY_CHANNEL_TTL, ttlMap);
             }
 
             // Save channel name from page title
@@ -652,7 +654,7 @@
             if (!names[channelId]) {
                 const label = document.title?.replace(' | Discord', '').trim() || `Channel ${channelId}`;
                 names[channelId] = label;
-                store.set(KEY_CHANNEL_NAMES, names);
+                await store.set(KEY_CHANNEL_NAMES, names);
             }
 
             const effectiveTtl = ttlMap[channelId] ?? store.get(KEY_GLOBAL_TTL, 3600);
@@ -665,17 +667,17 @@
             renderChannelList();
         };
 
-        panel.querySelector('#dcad-disable-all').onclick = () => {
+        panel.querySelector('#dcad-disable-all').onclick = async () => {
             if (!window.confirm('Disable AutoDelete for all channels?')) return;
-            store.set(KEY_ENABLED, {});
+            await store.set(KEY_ENABLED, {});
             addLogUI('warn', 'AutoDelete disabled for all channels.');
             refreshUI();
             renderChannelList();
         };
 
-        panel.querySelector('#dcad-clear-history').onclick = () => {
+        panel.querySelector('#dcad-clear-history').onclick = async () => {
             if (!window.confirm('Clear deletion history?')) return;
-            store.set(KEY_MSG_HISTORY, []);
+            await store.set(KEY_MSG_HISTORY, []);
             addLogUI('warn', 'History cleared.');
             renderHistoryList();
         };
