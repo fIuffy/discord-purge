@@ -2,7 +2,7 @@
 // @name          Discord Full Account Purge
 // @description   Deletes all your messages across DMs, Group DMs, and Servers. Supports data package import and channel exclusions.
 // @namespace     https://github.com/fIuffy/discord-purge
-// @version       4.0
+// @version       4.1
 // @match         https://discord.com/*
 // @grant         GM_getValue
 // @grant         GM_setValue
@@ -16,7 +16,7 @@
  * 1. Open Discord in browser (discord.com)
  * 2. Paste into DevTools console (F12) or install via Tampermonkey
  * 3. Click the 🗑️ trash icon in the Discord toolbar
- * 4. Click "Get" to auto-fill token & author ID
+ * 4. Click "Auto-detect" to fill token & author ID automatically
  * 5. (Recommended) Import your data package for full coverage
  * 6. (Optional) Exclude channels you want to keep
  * 7. Click "Start Full Purge"
@@ -37,7 +37,6 @@
 
     const API = 'https://discord.com/api/v9';
 
-    // Message types a user can delete (own messages)
     const DELETABLE_TYPES = new Set([
         0,  // DEFAULT
         6,  // CHANNEL_PINNED_MESSAGE
@@ -46,14 +45,13 @@
         21, // THREAD_STARTER_MESSAGE
     ]);
 
-    // Channel types worth scanning for messages
     const TEXT_CHANNEL_TYPES = new Set([
         0,  // GUILD_TEXT
         5,  // GUILD_ANNOUNCEMENT
         10, // ANNOUNCEMENT_THREAD
         11, // PUBLIC_THREAD
         12, // PRIVATE_THREAD
-        15, // GUILD_FORUM (posts)
+        15, // GUILD_FORUM
         16, // GUILD_MEDIA
     ]);
 
@@ -129,82 +127,118 @@
         return { Authorization: token };
     }
 
-    // Extract a usable message from a search result entry.
-    // Discord used to return [[hit, ctx, ctx], [hit, ctx]] with hit.hit=true.
-    // They removed surrounding context, so now it's [[msg], [msg]] and the
-    // hit property may or may not be present. Handle all variants.
     function extractHit(entry) {
         if (!entry) return null;
         if (Array.isArray(entry)) {
-            // Nested array format — find tagged hit, or fall back to first element
             return entry.find((m) => m.hit) || entry[0] || null;
         }
-        // Flat object — already the message
         if (typeof entry === 'object' && entry.id) return entry;
         return null;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // TOKEN EXTRACTION
+    // TOKEN EXTRACTION — PASSIVE FETCH INTERCEPTION
     // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // Instead of digging through localStorage or webpack internals (which
+    // Discord changes constantly), we hook window.fetch and passively listen
+    // for the Authorization header on requests Discord is already making.
+    // Zero extra network traffic — just eavesdropping on existing calls.
 
-    function extractToken() {
-        // Method 1: iframe trick (works on most builds)
-        try {
-            window.dispatchEvent(new Event('beforeunload'));
-            const iframe = document.createElement('iframe');
-            document.body.appendChild(iframe);
-            const raw = iframe.contentWindow.localStorage.token || localStorage.token;
-            document.body.removeChild(iframe);
-            if (raw) return JSON.parse(raw);
-        } catch {}
+    function interceptToken(timeoutMs = 8000) {
+        return new Promise((resolve, reject) => {
+            const originalFetch = window.fetch;
+            let resolved = false;
 
-        // Method 2: direct localStorage
-        try {
-            const raw = localStorage.token;
-            if (raw) return JSON.parse(raw);
-        } catch {}
+            const timer = setTimeout(() => {
+                if (!resolved) {
+                    resolved = true;
+                    window.fetch = originalFetch;
+                    reject(new Error('Timed out waiting for an authenticated request. Try switching channels or clicking around in Discord to trigger API activity.'));
+                }
+            }, timeoutMs);
 
-        // Method 3: walk webpack modules for token store
-        try {
-            const wp = window.webpackChunkdiscord_app;
-            if (wp) {
-                let token = null;
-                wp.push([
-                    [Symbol()],
-                    {},
-                    (req) => {
-                        for (const key of Object.keys(req.c)) {
-                            const mod = req.c[key]?.exports;
-                            if (!mod) continue;
-                            const def = mod.default || mod;
-                            if (def?.getToken) {
-                                token = def.getToken();
-                                break;
-                            }
-                            if (def?.Z?.getToken) {
-                                token = def.Z.getToken();
-                                break;
+            window.fetch = function (...args) {
+                if (!resolved) {
+                    // Check Request object
+                    let auth = null;
+                    const [input, init] = args;
+
+                    // init.headers can be a plain object, Headers instance, or array
+                    if (init?.headers) {
+                        if (init.headers instanceof Headers) {
+                            auth = init.headers.get('Authorization');
+                        } else if (typeof init.headers === 'object') {
+                            // Plain object or array of pairs
+                            if (Array.isArray(init.headers)) {
+                                const pair = init.headers.find(([k]) => k.toLowerCase() === 'authorization');
+                                if (pair) auth = pair[1];
+                            } else {
+                                // Case-insensitive search on plain object
+                                for (const [k, v] of Object.entries(init.headers)) {
+                                    if (k.toLowerCase() === 'authorization') { auth = v; break; }
+                                }
                             }
                         }
-                    },
-                ]);
-                if (token) return token;
-            }
-        } catch {}
+                    }
 
-        return null;
+                    // Also check if input is a Request object with headers
+                    if (!auth && input instanceof Request) {
+                        auth = input.headers.get('Authorization');
+                    }
+
+                    if (auth && typeof auth === 'string' && auth.length > 20 && !auth.startsWith('Bot ')) {
+                        resolved = true;
+                        clearTimeout(timer);
+                        window.fetch = originalFetch;
+                        resolve(auth);
+                    }
+                }
+                return originalFetch.apply(this, args);
+            };
+        });
     }
 
-    function extractAuthorId() {
-        // Method 1: localStorage cache
-        try {
-            const raw = localStorage.user_id_cache;
-            if (raw) return JSON.parse(raw);
-        } catch {}
+    // Also hook XMLHttpRequest as a fallback — some Discord internal
+    // calls may use XHR instead of fetch
+    function interceptTokenXHR(timeoutMs = 8000) {
+        return new Promise((resolve, reject) => {
+            const originalOpen = XMLHttpRequest.prototype.open;
+            const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+            let resolved = false;
 
-        // Method 2: fetch from API using token
-        return null;
+            const timer = setTimeout(() => {
+                if (!resolved) {
+                    resolved = true;
+                    XMLHttpRequest.prototype.open = originalOpen;
+                    XMLHttpRequest.prototype.setRequestHeader = originalSetHeader;
+                    reject(new Error('XHR interception timed out.'));
+                }
+            }, timeoutMs);
+
+            XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+                if (!resolved && name.toLowerCase() === 'authorization' && value && value.length > 20 && !value.startsWith('Bot ')) {
+                    resolved = true;
+                    clearTimeout(timer);
+                    XMLHttpRequest.prototype.open = originalOpen;
+                    XMLHttpRequest.prototype.setRequestHeader = originalSetHeader;
+                    resolve(value);
+                }
+                return originalSetHeader.call(this, name, value);
+            };
+        });
+    }
+
+    // Race both methods — whichever captures a token first wins
+    async function captureToken(timeoutMs = 8000) {
+        try {
+            return await Promise.any([
+                interceptToken(timeoutMs),
+                interceptTokenXHR(timeoutMs),
+            ]);
+        } catch {
+            throw new Error('Could not capture token. Try clicking around in Discord to trigger API calls, then retry.');
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -329,7 +363,7 @@
                         logFn('warn', `  Could not fetch channels for ${guild.name}: ${e.message}`);
                     }
 
-                    // Also grab active threads
+                    // Active threads
                     try {
                         const tr = await fetch(`${API}/guilds/${guild.id}/threads/active`, { headers });
                         if (tr.ok) {
@@ -392,7 +426,7 @@
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // GUILD ID RESOLUTION (for imported channels)
+    // GUILD ID RESOLUTION
     // ═══════════════════════════════════════════════════════════════════════════
 
     async function resolveGuildId(token, channelId) {
@@ -454,7 +488,6 @@
                 return;
             }
 
-            // Handle indexing delay
             if (resp.status === 202) {
                 const body = await resp.json();
                 const w = body.retry_after || 2000;
@@ -463,7 +496,6 @@
                 return search();
             }
 
-            // Handle rate limit
             if (resp.status === 429) {
                 const body = await resp.json();
                 const w = (body.retry_after || 1) * TIMING.retryMultiplier;
@@ -488,10 +520,10 @@
             const data = await resp.json();
 
             if (debugMode && grandTotal === null) {
-                logFn('verb', `Search response shape: total_results=${data.total_results}, messages.length=${data.messages?.length}, first entry type=${typeof data.messages?.[0]}, isArray=${Array.isArray(data.messages?.[0])}`);
+                logFn('verb', `Search response: total_results=${data.total_results}, messages.length=${data.messages?.length}, first entry isArray=${Array.isArray(data.messages?.[0])}`);
                 if (data.messages?.[0]) {
                     const sample = extractHit(data.messages[0]);
-                    logFn('verb', `Sample hit: id=${sample?.id}, type=${sample?.type}, hit=${sample?.hit}, author=${sample?.author?.id}`);
+                    logFn('verb', `Sample: id=${sample?.id}, type=${sample?.type}, hit=${sample?.hit}, author=${sample?.author?.id}`);
                 }
             }
 
@@ -506,15 +538,11 @@
                 return;
             }
 
-            // Extract hits — handle both nested and flat formats
             const hits = data.messages.map(extractHit).filter(Boolean);
-
-            // Filter to messages we can and should delete
             const toDelete = hits.filter((m) => {
                 if (m.author?.id !== authorId) return false;
                 return DELETABLE_TYPES.has(m.type);
             });
-
             const skippedCount = hits.length - toDelete.length;
 
             if (toDelete.length === 0) {
@@ -527,7 +555,6 @@
                 return;
             }
 
-            // Delete each message
             for (let j = 0; j < toDelete.length; j++) {
                 if (shouldStop()) { logFn('warn', 'Stopped.'); return; }
                 const msg = toDelete[j];
@@ -535,7 +562,6 @@
                 const preview = (msg.content || '').substring(0, 50);
                 logFn('info', `Deleting ${msg.id} (${ts}) ${preview ? `"${preview}…"` : '[no text]'}`);
 
-                // Adaptive delay decrease
                 if (delCount > 0 && delCount % TIMING.decrementEvery === 0) {
                     deleteDelay = Math.max(TIMING.deleteDelayMin, deleteDelay + TIMING.delayDecrement);
                 }
@@ -555,7 +581,7 @@
                         deleteDelay = Math.min(TIMING.deleteDelayMax, deleteDelay + TIMING.delayIncrement);
                         logFn('warn', `Rate limited on delete, cooling ${Math.round(w)}ms`);
                         await wait(w);
-                        j--; // retry this message
+                        j--;
                         continue;
                     } else if (dr.status === 403 || dr.status === 400 || dr.status === 404) {
                         logFn('warn', `Cannot delete ${msg.id} (HTTP ${dr.status}), skipping.`);
@@ -638,7 +664,10 @@
         #dcpurge code{background:#111214;border-radius:3px;padding:1px 5px;font-size:11px;color:#b5bac1;}
         #dcpurge .auth-ok{color:#43b581;font-size:12px;}
         #dcpurge .auth-fail{color:#f04747;font-size:12px;}
+        #dcpurge .auth-waiting{color:#faa61a;font-size:12px;}
         .dcpurge-info{color:#00b0f4}.dcpurge-warn{color:#faa61a}.dcpurge-error{color:#f04747}.dcpurge-success{color:#43b581}.dcpurge-verb{color:#555760}
+        @keyframes dcpurge-spin{to{transform:rotate(360deg)}}
+        #dcpurge .spinner{display:inline-block;width:12px;height:12px;border:2px solid #4e5058;border-top-color:#5865f2;border-radius:50%;animation:dcpurge-spin .6s linear infinite;vertical-align:middle;margin-right:6px;}
     `;
     document.head.appendChild(Object.assign(document.createElement('style'), { textContent: CSS }));
 
@@ -651,7 +680,7 @@
     panel.style.display = 'none';
     panel.innerHTML = `
         <div class="hdr">
-            🗑️ Discord Full Account Purge <span class="ver">v4.0</span>
+            🗑️ Discord Full Account Purge <span class="ver">v4.1</span>
             <button id="dcpurge-close" style="background:transparent;font-size:18px;padding:0 6px;">✕</button>
         </div>
         <div class="tabs">
@@ -664,18 +693,16 @@
         <div class="tp active" id="tab-main">
             <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;">
                 <div>
-                    <div style="font-size:12px;color:#72767d;margin-bottom:2px;">Auth Token *</div>
-                    <input type="password" id="ui-token" placeholder="Paste or use Get">
-                    <button id="ui-get-token">Get</button>
+                    <div style="font-size:12px;color:#72767d;margin-bottom:2px;">Auth Token</div>
+                    <input type="password" id="ui-token" placeholder="Auto-detected or paste manually">
                 </div>
                 <div>
-                    <div style="font-size:12px;color:#72767d;margin-bottom:2px;">Author ID *</div>
-                    <input type="text" id="ui-author" placeholder="Your user ID">
-                    <button id="ui-get-author">Get</button>
+                    <div style="font-size:12px;color:#72767d;margin-bottom:2px;">Author ID</div>
+                    <input type="text" id="ui-author" placeholder="Auto-detected" readonly>
                 </div>
-                <button id="ui-verify" class="muted" style="height:30px;">🔑 Verify</button>
-                <span id="ui-auth-status"></span>
+                <button id="ui-autodetect" class="success" style="height:30px;">🔑 Auto-detect</button>
             </div>
+            <div id="ui-auth-status"></div>
             <div id="ui-source-summary" style="font-size:12px;color:#72767d;margin-top:2px;"></div>
             <div style="font-size:12px;color:#faa61a;margin-top:2px;">⚠️ Deletes ALL your messages everywhere except excluded channels. Irreversible.</div>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
@@ -906,49 +933,66 @@
         renderExclusionList();
     };
 
-    // ── Token / Author buttons ────────────────────────────────────────────────
+    // ── Close & Clear ─────────────────────────────────────────────────────────
     $('#dcpurge-close').onclick = () => { panel.style.display = 'none'; };
     $('#ui-clear-log').onclick = () => { logEl.innerHTML = ''; };
 
-    $('#ui-get-token').onclick = () => {
-        const token = extractToken();
-        if (token) {
-            tokenEl.value = token;
-            addLog('success', 'Token extracted.');
-        } else {
-            addLog('error', 'Could not auto-extract token. Paste it manually (DevTools → Application → Local Storage → token).');
-        }
-    };
+    // ── Auto-detect button ────────────────────────────────────────────────────
+    $('#ui-autodetect').onclick = async () => {
+        const autoBtn = $('#ui-autodetect');
+        autoBtn.disabled = true;
 
-    $('#ui-get-author').onclick = () => {
-        const id = extractAuthorId();
-        if (id) {
-            authorEl.value = id;
-            addLog('success', 'Author ID extracted.');
-        } else {
-            addLog('warn', 'Could not auto-extract ID. Click Verify after filling in your token to fetch it from the API.');
+        // If token is already filled and valid, just verify it
+        const existingToken = tokenEl.value.trim();
+        if (existingToken) {
+            authStatusEl.innerHTML = '<span class="spinner"></span> Verifying existing token…';
+            authStatusEl.className = 'auth-waiting';
+            const result = await verifyAuth(existingToken);
+            if (result.ok) {
+                authorEl.value = result.user.id;
+                authStatusEl.textContent = `✓ ${result.user.username}#${result.user.discriminator || '0'} (${result.user.id})`;
+                authStatusEl.className = 'auth-ok';
+                addLog('success', `Verified: ${result.user.username} (${result.user.id})`);
+                autoBtn.disabled = false;
+                return;
+            }
+            addLog('warn', 'Existing token is invalid. Attempting to capture a fresh one…');
         }
-    };
 
-    // ── Verify auth ───────────────────────────────────────────────────────────
-    $('#ui-verify').onclick = async () => {
-        const token = tokenEl.value.trim();
-        if (!token) { addLog('error', 'Enter a token first.'); return; }
-        authStatusEl.textContent = 'Verifying…';
-        authStatusEl.className = '';
+        // Passive interception
+        authStatusEl.innerHTML = '<span class="spinner"></span> Listening for Discord API traffic… click around or switch channels if needed';
+        authStatusEl.className = 'auth-waiting';
+        addLog('info', 'Intercepting outgoing requests to capture auth token…');
+
+        let token;
+        try {
+            token = await captureToken(10000);
+        } catch (e) {
+            authStatusEl.textContent = `✗ ${e.message}`;
+            authStatusEl.className = 'auth-fail';
+            addLog('error', e.message);
+            autoBtn.disabled = false;
+            return;
+        }
+
+        tokenEl.value = token;
+        addLog('success', 'Token captured from network traffic.');
+
+        // Immediately verify and fill author ID
+        authStatusEl.innerHTML = '<span class="spinner"></span> Verifying token…';
         const result = await verifyAuth(token);
         if (result.ok) {
+            authorEl.value = result.user.id;
             authStatusEl.textContent = `✓ ${result.user.username}#${result.user.discriminator || '0'} (${result.user.id})`;
             authStatusEl.className = 'auth-ok';
-            if (!authorEl.value.trim()) {
-                authorEl.value = result.user.id;
-                addLog('success', `Auto-filled author ID: ${result.user.id}`);
-            }
+            addLog('success', `Authenticated as ${result.user.username} (${result.user.id})`);
         } else {
-            authStatusEl.textContent = `✗ ${result.error}`;
+            authStatusEl.textContent = `✗ Token captured but verification failed: ${result.error}`;
             authStatusEl.className = 'auth-fail';
-            addLog('error', `Auth verification failed: ${result.error}`);
+            addLog('error', `Verification failed: ${result.error}`);
         }
+
+        autoBtn.disabled = false;
     };
 
     // ── Main purge flow ───────────────────────────────────────────────────────
@@ -960,19 +1004,19 @@
     startBtn.onclick = async () => {
         const token = tokenEl.value.trim();
         const authorId = authorEl.value.trim();
-        if (!token || !authorId) { addLog('error', 'Token and Author ID are both required.'); return; }
+        if (!token || !authorId) { addLog('error', 'Click Auto-detect first, or paste token and author ID manually.'); return; }
         const debugMode = debugEl.checked;
 
-        // Verify auth first
+        // Verify auth
         addLog('info', 'Verifying credentials…');
         const authCheck = await verifyAuth(token);
         if (!authCheck.ok) {
-            addLog('error', `Auth failed: ${authCheck.error}. Check your token.`);
+            addLog('error', `Auth failed: ${authCheck.error}. Click Auto-detect to get a fresh token.`);
             return;
         }
         addLog('success', `Authenticated as ${authCheck.user.username} (${authCheck.user.id})`);
         if (authCheck.user.id !== authorId) {
-            addLog('warn', `Author ID mismatch! Token belongs to ${authCheck.user.id}, but you entered ${authorId}. Using ${authCheck.user.id}.`);
+            addLog('warn', `Author ID mismatch! Using ${authCheck.user.id} from API.`);
             authorEl.value = authCheck.user.id;
         }
         const confirmedAuthorId = authCheck.user.id;
