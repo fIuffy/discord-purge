@@ -1,175 +1,165 @@
-# discord-purge
+# Ghostcord
 
-### Take back your message history.
+Take back your message history.
 
-Discord lets you delete your account but keeps every message you ever sent. They stay visible in servers and DMs indefinitely, attached to your account ID, readable by anyone in those channels. This project gives you actual control over that.
+Discord keeps every message you've ever sent, visible indefinitely to anyone in those channels. Ghostcord gives you two ways to deal with that: wipe everything at once, or make messages disappear automatically after a time limit you set.
 
-Two scripts: one that wipes everything in bulk, one that makes messages disappear automatically after a time limit you set.
+One script, one panel, shared engine.
 
-> Core delete logic based on [Deletecord](https://github.com/bekkibau/deletecord) by bekkibau.
-
----
-
-## What's in here
-
-| Script | What it does |
-|--------|-------------|
-| [`discord_purge_all.user.js`](./discord_purge_all.user.js) | Bulk delete every message your account has ever sent, across every server, DM, and group chat |
-| [`discord_autodelete.user.js`](./discord_autodelete.user.js) | Automatically delete messages you send after a configured time limit, per-channel |
-
-No external servers. No data collection. Everything runs in your browser using your own credentials against Discord's own API.
+> Core delete logic originally based on [Deletecord](https://github.com/bekkibau/deletecord) by bekkibau.
 
 ---
 
-## Script 1 - Full Account Purge
+## Modes
+
+**Purge** — Bulk delete every message your account has ever sent across every server, DM, and group chat. Discovers channels via live API and optional data package import.
+
+**AutoDelete** — Background daemon that scans enabled channels on a timer and deletes any of your messages older than a configurable TTL. Per-channel overrides supported. Runs every 60 seconds by default and fires immediately when you tab back in.
+
+Both modes share authentication, exclusions, the deletion engine, and a persistent history log.
+
+---
+
+## Setup
+
+### Option A — Console (one-time, no install)
+
+1. Open [discord.com](https://discord.com) in a browser
+2. Press `F12`, go to Console
+3. Paste the contents of `ghostcord.user.js` and hit Enter
+4. A ghost icon appears in the Discord toolbar — click it
+5. Go to the **Auth** tab and click **Auto-detect**
+
+### Option B — Tampermonkey / Violentmonkey (persistent)
+
+Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/), create a new userscript, paste the contents, save. The script loads automatically on every Discord session. Credentials, channel settings, exclusions, and history persist between sessions.
+
+---
+
+## Auth
+
+Ghostcord captures your token passively by listening to requests Discord is already making in the background. No extra network traffic — it reads the `Authorization` header off the next outgoing API call (presence updates, typing events, etc). One click fills both your token and author ID.
+
+Credentials are saved to local storage so the AutoDelete daemon works across page reloads without re-detecting.
+
+---
+
+## Purge
 
 ### How it works
 
-The script searches Discord's API for messages authored by your account and deletes them. It covers three sources automatically:
+The script searches Discord's API for messages authored by your account and deletes them one by one. It covers three sources automatically:
 
-1. **Open DMs and group DMs** in your sidebar
-2. **Friends list** - re-opens a DM channel with every friend, catching conversations you dismissed from your sidebar. Handles rate limits and retries automatically, including dormant DMs that Discord throttles harder.
-3. **All text channels** in every server you are currently in
+1. **Open DMs and group DMs** currently in your sidebar
+2. **Friends list** — re-opens a DM channel with every friend, catching conversations you've dismissed from the sidebar
+3. **All text channels and active threads** in every server you're in
 
-On top of that, you can import your **Discord data package**, which contains a complete index of every channel you have ever sent a message in - including servers you have left, closed DMs, and conversations with accounts that have since been deleted. This is the most thorough path to a full wipe.
+For complete coverage, import your **Discord data package** which indexes every channel you've ever sent a message in, including servers you've left, closed DMs, and deleted-user conversations.
 
-### Setup
+### Importing your data package
 
-**Option A - Paste into console (no install, works once)**
-
-1. Open [discord.com](https://discord.com) in a browser
-2. Open DevTools with `F12`, go to the Console tab
-3. Paste the full contents of `discord_purge_all.user.js` and hit Enter
-4. A trash icon appears in the Discord toolbar - click it
-5. Click **Get** next to Auth Token and Author ID to auto-fill both
-6. Optionally set up exclusions or import your data package (see below)
-7. Click **Start Full Purge**
-
-**Option B - Tampermonkey / Violentmonkey (persists across sessions)**
-
-Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/), create a new userscript, paste the contents, and save. The script will run automatically whenever you open Discord. Your exclusions and imported channels are saved between sessions.
-
-### Importing your Discord data package
-
-This is the recommended step if you want complete coverage. The live API can only see channels currently accessible to your account. Your data package has the full picture.
-
-**Requesting it:**
-1. Discord -> User Settings -> Privacy & Safety -> Request Data Export
-2. Select Messages and hit Request My Data
-3. Wait for the email - Discord says up to 30 days but it usually arrives within a few hours
-4. Download and unzip
-
-**Importing it:**
-1. Open the purge panel and go to the **Data Package** tab
-2. Drop in either `messages/index.json` from the unzipped folder, or the entire zip - the script extracts what it needs automatically
-3. Channels from the package are merged with live-discovered ones, duplicates removed
-4. Start the purge as normal
-
-### Excluding channels
-
-If there are channels you want left untouched, go to the **Exclusions** tab before starting.
-
-- Navigate to any channel and click **Exclude Current Channel** to add it by name automatically
-- Or paste a channel ID manually with an optional label
-- Remove exclusions individually or clear all at once
-
-The confirmation dialog before the purge starts shows a full breakdown of what will be processed and what is being skipped.
+1. Discord → User Settings → Privacy & Safety → Request Data Export
+2. Wait for the email (usually hours, can take up to 30 days)
+3. Download the zip
+4. In the **Import** tab, drop in `messages/index.json` or the entire zip — the script extracts what it needs
+5. Imported channels are merged with live discovery, duplicates removed
 
 ### Time estimates
 
-Discord rate limits deletions to roughly 1-2 seconds each. This is enforced server-side and cannot be bypassed without risking your account.
+Discord rate limits deletions to roughly 1–2 seconds each. This is server-side and cannot be bypassed.
 
-| Message count | Rough estimate |
-|---------------|----------------|
-| 1,000         | ~30 minutes    |
-| 10,000        | ~4-5 hours     |
-| 50,000+       | Overnight      |
+| Messages | Estimate |
+|----------|----------|
+| 1,000 | ~30 minutes |
+| 10,000 | ~4–5 hours |
+| 50,000+ | Overnight |
 
-The script handles rate limit responses automatically - it backs off when Discord asks it to and resumes without you needing to do anything.
+The script handles rate limits automatically — backs off when Discord asks, resumes without intervention.
 
 ---
 
-## Script 2 - AutoDelete (expiring messages)
-
-Periodically searches each enabled channel for messages you have sent and deletes any that are older than the configured TTL. Each scan fully drains expired messages per channel - it loops through paginated search results and deletes everything that has aged out, not just one page worth. Runs every 60 seconds in the background by default, and also fires immediately when you switch back to the tab.
-
-**Requires Tampermonkey or Violentmonkey** for persistent storage.
-
-### Setup
-
-1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
-2. Create a new userscript and paste `discord_autodelete.user.js`
-3. Open Discord - a clock icon appears in the toolbar
-4. Click **Get** next to Auth Token and Author ID, then **Save settings**
-5. Set a Global TTL in seconds
-6. Navigate to any channel and click **Enable**, or manage all channels from the **Channels** tab
-
-### The panel
-
-- **Settings** - credentials, global TTL, scan interval, quick toggle for the current channel, and a manual scan button
-- **Channels** - list of every enabled channel with inline TTL editing and a disable button, no navigating required
-- **History** - log of every message deleted, with content preview, channel name, and timestamp. Persists across sessions up to 500 entries.
-- **Log** - live event log for scans, deletions, and errors
-
-### TTL reference
-
-| Seconds  | Duration |
-|----------|----------|
-| `3600`   | 1 hour   |
-| `86400`  | 1 day    |
-| `604800` | 1 week   |
+## AutoDelete
 
 ### How it works
 
-```
-Every N seconds (your configured scan interval, default 60):
-       |
-For each enabled channel:
-       |
-  Search for messages by your account (paginated, 25 per page)
-       |
-  For each result, compare the message timestamp against the TTL cutoff
-       |
-  If (now - message_timestamp) > TTL, delete the message
-       |
-  Re-search and repeat until no expired messages remain in that channel
-       |
-  Adaptive rate limiting: starts at ~1.2s per delete, speeds up gradually
-  on sustained success, backs off automatically on failures or 429s
-```
+On a configurable interval (default 60 seconds), the daemon scans each enabled channel for your messages and deletes any older than the TTL. Also fires immediately when you switch back to the Discord tab.
 
-Your token is only ever stored in Tampermonkey's local storage on your own machine. It is never sent anywhere except Discord's own API.
+### Setup
+
+1. Go to the **AutoDelete** tab
+2. Set a Global TTL in seconds (e.g. `3600` = 1 hour)
+3. Optionally adjust the scan interval
+4. Click **Save settings**
+5. Navigate to any channel and click **Enable** to turn on AutoDelete for that channel
+
+### Per-channel overrides
+
+Each channel can have its own TTL. Set it in the **Channels** tab or when enabling a channel. If no override is set, the global TTL applies.
+
+### TTL reference
+
+| Seconds | Duration |
+|---------|----------|
+| `3600` | 1 hour |
+| `86400` | 1 day |
+| `604800` | 1 week |
 
 ---
 
-## Frequently asked questions
+## Exclusions
 
-**Does this actually delete messages or just hide them?**
-It sends DELETE requests to Discord's API. The messages are removed from Discord's servers. Per their own documentation, manually deleted messages are not retained and will not appear in data packages.
+Excluded channels are skipped by both Purge and AutoDelete. Add them from the **Exclusions** tab by navigating to a channel and clicking **Exclude Current Channel**, or by pasting a channel ID manually.
 
-**What about messages in servers I have already left?**
-The live API cannot reach those. Import your data package - it indexes every channel you ever sent a message in, regardless of whether you are still a member.
+---
 
-**Will Discord flag my account for this?**
-Automating a user account is against Discord's Terms of Service. The script is deliberately slow (1-2s per delete) to avoid unusual traffic patterns, but there is no guarantee. Use your own judgement.
+## History
 
-**Can it delete messages sent by other people?**
-No. Discord's API only permits users to delete their own messages. The script only targets messages authored by the account whose token you provide.
+Every deletion from both modes is logged with a content preview, channel name, timestamp, and mode tag (🗑️ purge / ⏱️ autodelete). History persists across sessions, capped at 500 entries. Viewable in the **History** tab.
+
+---
+
+## Message types deleted
+
+Ghostcord deletes these message types when authored by your account:
+
+- Default messages (type 0)
+- Pin notifications (type 6)
+- Replies (type 19)
+- Slash command responses (type 20)
+- Thread starter messages (type 21)
+
+System messages and messages by other users are never touched.
+
+---
+
+## FAQ
+
+**Does this actually delete messages?**
+Yes. It sends DELETE requests to Discord's API. Messages are removed from their servers and won't appear in future data exports.
+
+**What about messages in servers I've left?**
+The live API can't reach those. Import your data package — it indexes every channel you've ever messaged in regardless of membership.
+
+**Will Discord flag my account?**
+Automating a user account violates Discord's Terms of Service. The script is deliberately slow to avoid unusual traffic patterns, but there's no guarantee. Use your own judgment.
+
+**Can it delete other people's messages?**
+No. The API only allows users to delete their own messages.
 
 **Is my token safe?**
-Your token is never transmitted anywhere except directly to Discord's API. When using the Tampermonkey version it is stored in browser-local Tampermonkey storage. When pasting into the console it exists only in memory for that session. Do not share your token with anyone - it gives full access to your account.
+Your token is never sent anywhere except Discord's own API. When using Tampermonkey it's stored in browser-local extension storage. When pasting into the console it exists only in memory for that session.
 
 ---
 
 ## Disclaimer
 
-Deletions are permanent and cannot be undone. These scripts use Discord's official API with your own credentials. Automating a user account is against Discord's Terms of Service. Use at your own risk.
+Deletions are permanent. This script uses Discord's API with your own credentials. Automating a user account is against Discord's Terms of Service. Use at your own risk.
 
 ---
 
 ## Credits
 
-[bekkibau/deletecord](https://github.com/bekkibau/deletecord) - original single-channel delete logic
+[bekkibau/deletecord](https://github.com/bekkibau/deletecord) — original single-channel delete logic
 
 ---
 
