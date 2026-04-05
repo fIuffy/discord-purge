@@ -82,6 +82,8 @@
         AD_ENABLED: 'gc_ad_enabled', AD_CHANNEL_TTL: 'gc_ad_channelTtl',
         AD_GLOBAL_TTL: 'gc_ad_globalTtl', AD_SCAN_INTERVAL: 'gc_ad_scanInterval',
         AD_CHANNEL_NAMES: 'gc_ad_channelNames', HISTORY: 'gc_history',
+        AD_MASTER: 'gc_ad_master', AD_CHANNEL_GUILDS: 'gc_ad_channelGuilds',
+        AD_FILTER_MODE: 'gc_ad_filterMode', AD_FILTER_PATTERNS: 'gc_ad_filterPatterns',
     };
 
     // ── Storage helpers ───────────────────────────────────────────────────────
@@ -211,7 +213,7 @@
         logFn('info', 'Scanning open DMs…');
         try {
             const r = await fetch(`${API}/users/@me/channels`, { headers });
-            if (r.ok) { const dms = await r.json(); for (const dm of dms) push({ guildId: '@me', channelId: dm.id, label: dm.name || dm.recipients?.map(u => u.username).join(', ') || 'DM', source: 'live' }); logFn('success', `  ${(await r.clone().json()).length || 0} open DM(s).`); }
+            if (r.ok) { const dms = await r.json(); for (const dm of dms) push({ guildId: '@me', channelId: dm.id, label: dm.name || dm.recipients?.map(u => u.username).join(', ') || 'DM', source: 'live' }); logFn('success', `  ${dms.length} open DM(s).`); }
         } catch (e) { logFn('warn', `  DM fetch failed: ${e.message}`); }
 
         logFn('info', 'Scanning friends list…');
@@ -323,7 +325,8 @@
             }
 
             const hits = data.messages.map(extractHit).filter(Boolean);
-            const toDelete = hits.filter(m => {
+            // Two-stage filter: cutoff first (drives early-exit logic), then content filter
+            const passedCutoff = hits.filter(m => {
                 if (m.author?.id !== authorId) return false;
                 if (!DELETABLE_TYPES.has(m.type)) return false;
                 if (cutoffTs !== null && cutoffTs !== undefined) {
@@ -332,12 +335,13 @@
                 }
                 return true;
             });
+            const toDelete = ctrl.filterFn ? passedCutoff.filter(ctrl.filterFn) : passedCutoff;
             const skipped = hits.length - toDelete.length;
 
             if (toDelete.length === 0) {
-                // In autodelete mode, if we skipped messages they're newer than cutoff,
-                // so no point paging further (results sorted desc by timestamp)
-                if (cutoffTs !== null) { logFn('success', `Channel done — deleted: ${delCount}, failed: ${failCount}`); return; }
+                // In autodelete mode, only stop early if the CUTOFF eliminated everything.
+                // If content filter excluded them, keep paging — older messages may still match.
+                if (cutoffTs !== null && passedCutoff.length === 0) { logFn('success', `Channel done — deleted: ${delCount}, failed: ${failCount}`); return; }
                 if ((data.total_results || 0) - offset > 0) { offset += skipped || 25; await wait(TIMING.searchDelay); return search(); }
                 logFn('success', `Channel done — deleted: ${delCount}, failed: ${failCount}`); return;
             }
@@ -381,10 +385,16 @@
     // AUTODELETE DAEMON
     // ═══════════════════════════════════════════════════════════════════════════
 
+    function getCurrentGuildId() {
+        const m = location.href.match(/channels\/([\w@]+)\/\d+/);
+        return m ? m[1] : '@me';
+    }
+
     let adTickRunning = false;
     let adSessionDeleted = 0;
 
     async function adTick() {
+        if (!store.get(K.AD_MASTER, true)) return;
         if (adTickRunning) return;
         const token = store.get(K.TOKEN, '');
         const authorId = store.get(K.AUTHOR, '');
@@ -399,6 +409,17 @@
         adTickRunning = true;
         updateAdStatus('Scanning…');
 
+        const filterMode = store.get(K.AD_FILTER_MODE, 'all');
+        const filterPatterns = store.get(K.AD_FILTER_PATTERNS, []);
+        let filterFn = null;
+        if (filterMode !== 'all' && filterPatterns.length > 0) {
+            filterFn = (msg) => {
+                const content = (msg.content || '').toLowerCase();
+                const matches = filterPatterns.some(p => content.includes(p.toLowerCase()));
+                return filterMode === 'whitelist' ? matches : !matches;
+            };
+        }
+
         try {
             for (const channelId of channels) {
                 if (exclusions[channelId]) continue;
@@ -409,10 +430,13 @@
 
                 updateAdStatus(`Scanning ${getChannelLabel(channelId)}…`);
 
-                await deleteInChannel(token, authorId, '@me', channelId, {
+                const guildMap = store.get(K.AD_CHANNEL_GUILDS, {});
+                const guildId = guildMap[channelId] || '@me';
+                await deleteInChannel(token, authorId, guildId, channelId, {
                     logFn: addLog,
                     debugMode: false,
                     cutoffTs: cutoff,
+                    filterFn,
                     shouldStop: () => false,
                     onDelete: (msg) => {
                         adSessionDeleted++;
@@ -439,13 +463,17 @@
     setTimeout(adTick, 4000);
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') adTick(); });
     setInterval(() => {
-        adNextTickSecs = Math.max(0, adNextTickSecs - 1);
+        const masterOn = store.get(K.AD_MASTER, true);
+        if (masterOn) adNextTickSecs = Math.max(0, adNextTickSecs - 1);
         const el = document.querySelector('#gc-ad-next');
-        if (el) el.textContent = adTickRunning ? 'Scanning…' : `Next scan in ${adNextTickSecs}s`;
-        if (adNextTickSecs === 0 && !adTickRunning) adNextTickSecs = getAdTickMs() / 1000;
+        if (el) {
+            if (!masterOn) el.textContent = 'AutoDelete paused';
+            else el.textContent = adTickRunning ? 'Scanning…' : `Next scan in ${adNextTickSecs}s`;
+        }
+        if (masterOn && adNextTickSecs === 0 && !adTickRunning) adNextTickSecs = getAdTickMs() / 1000;
     }, 1000);
 
-    function updateAdStatus(t) { const el = document.querySelector('#gc-ad-status'); if (el) el.textContent = t; }
+    function updateAdStatus(t) { const el = document.querySelector('#gc-ad-next'); if (el) el.textContent = t; }
     function updateAdCounter() { const el = document.querySelector('#gc-ad-counter'); if (el) el.textContent = adSessionDeleted.toLocaleString(); }
 
     // Keep-alive to prevent throttling in background tabs
@@ -470,8 +498,8 @@
         #gc .tab{padding:9px 14px;cursor:pointer;font-size:13px;font-weight:500;color:#949ba4;border-bottom:2px solid transparent;margin-bottom:-2px;user-select:none;transition:color .15s;}
         #gc .tab:hover{color:#dcddde;}
         #gc .tab.active{color:#fff;border-bottom-color:#5865f2;}
-        #gc .tp{display:none;padding:12px;flex-direction:column;gap:8px;background:#1e1f22;overflow-y:auto;}
-        #gc .tp.active{display:flex;}
+        #gc .tp{display:none;padding:12px;flex-direction:column;gap:8px;background:#1e1f22;}
+        #gc .tp.active{display:flex;flex:0 0 auto;overflow-y:auto;max-height:55vh;}
         #gc input[type=password],#gc input[type=text],#gc input[type=number]{background:#111214;color:#dcddde;border:1px solid #2b2d31;border-radius:4px;padding:0 .6em;height:30px;width:200px;margin:2px;outline:none;font-size:13px;transition:border-color .15s;}
         #gc input[type=number]{width:90px;}
         #gc input:focus{border-color:#5865f2;}
@@ -483,7 +511,7 @@
         #gc button.muted{background:#383a40;}
         #gc button.sm{padding:3px 10px;font-size:11px;}
         #gc button:disabled{opacity:.35;cursor:not-allowed;filter:none;}
-        #gc .log{overflow:auto;font-size:.72rem;font-family:Consolas,'Courier New',monospace;flex-grow:1;padding:10px 12px;white-space:pre-wrap;background:#111214;color:#c7cad1;border-top:1px solid #2b2d31;}
+        #gc .log{overflow:auto;font-size:.72rem;font-family:Consolas,'Courier New',monospace;flex:1 1 0;min-height:120px;padding:10px 12px;white-space:pre-wrap;background:#111214;color:#c7cad1;border-top:1px solid #2b2d31;}
         #gc .sbar{padding:7px 14px;background:#111214;border-radius:0 0 8px 8px;border-top:1px solid #000;font-size:12px;color:#949ba4;display:flex;gap:14px;align-items:center;flex-wrap:wrap;}
         #gc progress{width:140px;height:6px;border-radius:3px;border:none;background:#2b2d31;vertical-align:middle;}
         #gc progress::-webkit-progress-bar{background:#2b2d31;border-radius:3px;}
@@ -518,6 +546,10 @@
         #gc .ch-name{flex:1;font-size:13px;color:#dcddde;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
         #gc .badge-on{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:#248046;color:#fff;}
         #gc .badge-off{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:#383a40;color:#949ba4;}
+        #gc .mode-slider{display:flex;background:#111214;border-radius:6px;padding:2px;gap:2px;align-self:flex-start;}
+        #gc .mode-btn{flex:1;padding:5px 14px;font-size:12px;font-weight:500;border-radius:4px;background:transparent;color:#949ba4;border:none;cursor:pointer;transition:background .15s,color .15s;}
+        #gc .mode-btn.active{background:#5865f2;color:#fff;}
+        #gc .mode-btn:hover:not(.active){background:#2b2d31;color:#dcddde;}
         .gc-info{color:#00b0f4}.gc-warn{color:#faa61a}.gc-error{color:#f04747}.gc-success{color:#43b581}.gc-verb{color:#555760}
         @keyframes gc-spin{to{transform:rotate(360deg)}}
         #gc .spinner{display:inline-block;width:12px;height:12px;border:2px solid #4e5058;border-top-color:#5865f2;border-radius:50%;animation:gc-spin .6s linear infinite;vertical-align:middle;margin-right:6px;}
@@ -579,6 +611,14 @@
 
         <!-- AUTODELETE -->
         <div class="tp" id="tab-autodelete">
+            <div class="fr" style="justify-content:space-between;align-items:center;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <span class="section" style="margin:0;">AutoDelete Daemon</span>
+                    <span id="gc-ad-master-badge" class="badge-on">RUNNING</span>
+                </div>
+                <button id="gc-ad-master-toggle" class="danger sm">Pause</button>
+            </div>
+            <hr>
             <div class="section">Global TTL</div>
             <div class="fr">
                 <span class="fl">Seconds</span>
@@ -607,6 +647,22 @@
             <hr>
             <div class="fr">
                 <button id="gc-ad-scan-now" class="success sm">Scan now</button>
+            </div>
+            <hr>
+            <div class="section">Message filter</div>
+            <div style="font-size:11px;color:#4e5058;margin-bottom:6px;"><b>All</b> — delete any message past TTL &nbsp;·&nbsp; <b>Whitelist</b> — only delete messages containing a keyword &nbsp;·&nbsp; <b>Blacklist</b> — delete all except messages containing a keyword</div>
+            <div class="mode-slider" id="gc-ad-filter-slider">
+                <button class="mode-btn active" data-mode="all">All</button>
+                <button class="mode-btn" data-mode="whitelist">Whitelist</button>
+                <button class="mode-btn" data-mode="blacklist">Blacklist</button>
+            </div>
+            <div id="gc-ad-filter-patterns" style="display:none;">
+                <div class="add-row" style="margin-top:6px;">
+                    <input type="text" id="gc-ad-filter-input" placeholder="Keyword or phrase" style="flex:1;width:auto;max-width:260px;">
+                    <button id="gc-ad-filter-add" class="sm success">Add</button>
+                </div>
+                <ul class="ch-list" id="gc-ad-filter-list" style="max-height:150px;margin-top:4px;"></ul>
+                <div class="ch-empty" id="gc-ad-filter-empty" style="font-size:11px;color:#4e5058;padding:8px 0;">No keywords yet — all messages past TTL will be skipped.</div>
             </div>
         </div>
 
@@ -659,7 +715,7 @@
             <div class="ch-empty" id="gc-ex-empty">No exclusions yet.</div>
         </div>
 
-        <div class="log" id="gc-log" style="flex-grow:1;">Ghostcord v1.0 ready.\n</div>
+        <div class="log" id="gc-log">Ghostcord v1.0 ready.\n</div>
         <div class="sbar">
             <span id="gc-status">Idle</span>
             <progress id="gc-progress" value="0" max="1" style="display:none;"></progress>
@@ -699,7 +755,7 @@
         });
         logEl.appendChild(line);
         while (logEl.children.length > 3000) logEl.removeChild(logEl.firstChild);
-        if (autoScrollEl?.checked) line.scrollIntoView(false);
+        if (autoScrollEl?.checked) logEl.scrollTop = logEl.scrollHeight;
     }
 
     // ── Tabs ──────────────────────────────────────────────────────────────────
@@ -856,6 +912,17 @@
     $('#gc-clear-log').onclick = () => { logEl.innerHTML = ''; };
 
     // ── AutoDelete settings tab ───────────────────────────────────────────────
+    function updateMasterToggleUI() {
+        const on = store.get(K.AD_MASTER, true);
+        const badge = $('#gc-ad-master-badge');
+        const btn = $('#gc-ad-master-toggle');
+        if (!badge || !btn) return;
+        badge.textContent = on ? 'RUNNING' : 'PAUSED';
+        badge.className = on ? 'badge-on' : 'badge-off';
+        btn.textContent = on ? 'Pause' : 'Resume';
+        btn.className = on ? 'danger sm' : 'success sm';
+    }
+
     function refreshAdSettings() {
         const globalTtl = store.get(K.AD_GLOBAL_TTL, 3600);
         const scanInt = store.get(K.AD_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL);
@@ -880,6 +947,8 @@
         } else {
             $('#gc-ad-ch-id').textContent = 'none';
         }
+        updateMasterToggleUI();
+        updateFilterSlider();
     }
 
     $('#gc-ad-ttl').oninput = function () { $('#gc-ad-ttl-preview').textContent = `= ${formatDuration(parseInt(this.value) || 0)}`; };
@@ -888,14 +957,32 @@
     $('#gc-ad-save').onclick = () => {
         const ttl = parseInt($('#gc-ad-ttl').value);
         const scanSecs = parseInt($('#gc-ad-interval').value);
-        if (ttl >= 60) store.set(K.AD_GLOBAL_TTL, ttl);
-        if (scanSecs >= 30) {
+        let anySaved = false;
+
+        if (!isNaN(ttl) && ttl >= 60) {
+            store.set(K.AD_GLOBAL_TTL, ttl);
+            anySaved = true;
+        } else {
+            const stored = store.get(K.AD_GLOBAL_TTL, 3600);
+            addLog('warn', `Global TTL not saved — must be ≥ 60s. Reverted to ${formatDuration(stored)}.`);
+            $('#gc-ad-ttl').value = stored;
+            $('#gc-ad-ttl-preview').textContent = `= ${formatDuration(stored)}`;
+        }
+
+        if (!isNaN(scanSecs) && scanSecs >= 30) {
             store.set(K.AD_SCAN_INTERVAL, scanSecs);
             clearInterval(adInterval);
             adInterval = setInterval(adTick, getAdTickMs());
             adNextTickSecs = getAdTickMs() / 1000;
+            anySaved = true;
+        } else {
+            const stored = store.get(K.AD_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL);
+            addLog('warn', `Scan interval not saved — must be ≥ 30s. Reverted to ${formatDuration(stored)}.`);
+            $('#gc-ad-interval').value = stored;
+            $('#gc-ad-interval-preview').textContent = `= ${formatDuration(stored)}`;
         }
-        addLog('success', `AutoDelete saved. TTL: ${formatDuration(ttl >= 60 ? ttl : store.get(K.AD_GLOBAL_TTL, 3600))}, interval: ${formatDuration(scanSecs >= 30 ? scanSecs : store.get(K.AD_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))}`);
+
+        if (anySaved) addLog('success', `AutoDelete saved. TTL: ${formatDuration(store.get(K.AD_GLOBAL_TTL, 3600))}, interval: ${formatDuration(store.get(K.AD_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))}`);
     };
 
     $('#gc-ad-toggle').onclick = () => {
@@ -905,6 +992,13 @@
         const nowOn = !enabled[chId];
         enabled[chId] = nowOn;
         store.set(K.AD_ENABLED, enabled);
+
+        if (nowOn) {
+            const guildId = getCurrentGuildId();
+            const guildMap = store.get(K.AD_CHANNEL_GUILDS, {});
+            guildMap[chId] = guildId;
+            store.set(K.AD_CHANNEL_GUILDS, guildMap);
+        }
 
         const ttlInput = parseInt($('#gc-ad-ch-ttl').value);
         if (ttlInput >= 60) { const ttlMap = store.get(K.AD_CHANNEL_TTL, {}); ttlMap[chId] = ttlInput; store.set(K.AD_CHANNEL_TTL, ttlMap); }
@@ -919,6 +1013,70 @@
     };
 
     $('#gc-ad-scan-now').onclick = () => { addLog('info', 'Manual scan…'); adTick(); };
+
+    // ── Message filter (whitelist / blacklist / all) ──────────────────────────
+    function renderFilterPatterns() {
+        const mode = store.get(K.AD_FILTER_MODE, 'all');
+        const patterns = store.get(K.AD_FILTER_PATTERNS, []);
+        const container = $('#gc-ad-filter-patterns');
+        const list = $('#gc-ad-filter-list');
+        const empty = $('#gc-ad-filter-empty');
+        if (!container) return;
+        container.style.display = mode === 'all' ? 'none' : '';
+        list.innerHTML = '';
+        if (patterns.length === 0) { empty.style.display = ''; return; }
+        empty.style.display = 'none';
+        for (const p of patterns) {
+            const li = document.createElement('li');
+            li.className = 'ch-row';
+            li.innerHTML = `<span class="ch-name">${p}</span><button class="sm danger gc-filter-remove" data-pattern="${p.replace(/"/g, '&quot;')}">Remove</button>`;
+            li.querySelector('.gc-filter-remove').onclick = () => {
+                const updated = store.get(K.AD_FILTER_PATTERNS, []).filter(x => x !== p);
+                store.set(K.AD_FILTER_PATTERNS, updated);
+                renderFilterPatterns();
+            };
+            list.appendChild(li);
+        }
+    }
+
+    function updateFilterSlider() {
+        const mode = store.get(K.AD_FILTER_MODE, 'all');
+        $('#gc-ad-filter-slider')?.querySelectorAll('.mode-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.mode === mode);
+        });
+        renderFilterPatterns();
+    }
+
+    $('#gc-ad-filter-slider')?.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.onclick = () => {
+            store.set(K.AD_FILTER_MODE, btn.dataset.mode);
+            updateFilterSlider();
+            addLog('info', `Message filter: ${btn.dataset.mode}`);
+        };
+    });
+
+    $('#gc-ad-filter-add').onclick = () => {
+        const input = $('#gc-ad-filter-input');
+        const val = input.value.trim();
+        if (!val) return;
+        const patterns = store.get(K.AD_FILTER_PATTERNS, []);
+        if (patterns.includes(val)) { addLog('warn', 'Keyword already in list.'); return; }
+        patterns.push(val);
+        store.set(K.AD_FILTER_PATTERNS, patterns);
+        input.value = '';
+        renderFilterPatterns();
+        addLog('success', `Filter keyword added: "${val}"`);
+    };
+
+    $('#gc-ad-filter-input').onkeydown = (e) => { if (e.key === 'Enter') $('#gc-ad-filter-add').click(); };
+
+    $('#gc-ad-master-toggle').onclick = () => {
+        const current = store.get(K.AD_MASTER, true);
+        store.set(K.AD_MASTER, !current);
+        updateMasterToggleUI();
+        addLog(!current ? 'success' : 'warn', !current ? 'AutoDelete daemon resumed.' : 'AutoDelete daemon paused.');
+        if (!current) adTick(); // fire immediately on resume
+    };
 
     // ── AD Channels tab ───────────────────────────────────────────────────────
     function renderAdChannelList() {
