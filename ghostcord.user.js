@@ -6,6 +6,7 @@
 // @match         https://discord.com/*
 // @grant         GM_getValue
 // @grant         GM_setValue
+// @require       https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
 // @run-at        document-idle
 // @license       MIT
 // ==/UserScript==
@@ -262,7 +263,7 @@
     // ═══════════════════════════════════════════════════════════════════════════
 
     async function parseDataPackage(file) {
-        if (file.name.endsWith('.zip')) return parseZip(file);
+        if (file.name.toLowerCase().endsWith('.zip')) return parseZip(file);
         return parseIndexJson(file);
     }
     async function parseIndexJson(file) {
@@ -271,11 +272,53 @@
         return result;
     }
     async function parseZip(file) {
-        if (!window.fflate) await new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js'; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
-        const unzipped = window.fflate.unzipSync(new Uint8Array(await file.arrayBuffer()));
-        const key = Object.keys(unzipped).find(k => k.match(/messages[/\\]index\.json$/i));
-        if (!key) throw new Error('Could not find messages/index.json in zip.');
-        return parseIndexJson(new Blob([unzipped[key]]));
+        const zip = new Uint8Array(await file.arrayBuffer());
+        const entry = findZipEntry(zip, /messages[/\\]index\.json$/i);
+        if (!entry) throw new Error('Could not find messages/index.json in zip.');
+        return parseIndexJson(new Blob([await readZipEntry(entry)]));
+    }
+    function readU16(bytes, offset) {
+        return bytes[offset] | (bytes[offset + 1] << 8);
+    }
+    function readU32(bytes, offset) {
+        return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+    }
+    function findZipEntry(bytes, nameRe) {
+        const decoder = new TextDecoder();
+        for (let i = bytes.length - 22, min = Math.max(0, bytes.length - 65558); i >= min; i--) {
+            if (readU32(bytes, i) !== 0x06054b50) continue;
+            const total = readU16(bytes, i + 10), cdOffset = readU32(bytes, i + 16);
+            let p = cdOffset;
+            for (let n = 0; n < total && p < bytes.length; n++) {
+                if (readU32(bytes, p) !== 0x02014b50) break;
+                const method = readU16(bytes, p + 10), compressedSize = readU32(bytes, p + 20);
+                const nameLen = readU16(bytes, p + 28), extraLen = readU16(bytes, p + 30), commentLen = readU16(bytes, p + 32);
+                const name = decoder.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+                if (nameRe.test(name)) {
+                    const local = readU32(bytes, p + 42);
+                    if (readU32(bytes, local) !== 0x04034b50) throw new Error('Invalid zip entry header.');
+                    const dataOffset = local + 30 + readU16(bytes, local + 26) + readU16(bytes, local + 28);
+                    return { method, data: bytes.subarray(dataOffset, dataOffset + compressedSize) };
+                }
+                p += 46 + nameLen + extraLen + commentLen;
+            }
+            return null;
+        }
+        return null;
+    }
+    async function readZipEntry(entry) {
+        if (entry.method === 0) return entry.data;
+        if (entry.method !== 8) throw new Error(`Unsupported zip compression method: ${entry.method}`);
+        return inflateRaw(entry.data);
+    }
+    async function inflateRaw(bytes) {
+        const fflateLib = typeof fflate !== 'undefined' ? fflate : globalThis.fflate || (typeof window !== 'undefined' && window.fflate);
+        if (fflateLib?.inflateSync) return fflateLib.inflateSync(bytes);
+        if (typeof DecompressionStream !== 'undefined') {
+            const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+            return new Uint8Array(await new Response(stream).arrayBuffer());
+        }
+        throw new Error('Zip compression is not supported by this browser. Install via Tampermonkey or use messages/index.json directly.');
     }
     async function resolveGuildId(token, channelId) {
         try { const r = await fetch(`${API}/channels/${channelId}`, { headers: authHeaders(token) }); if (!r.ok) return '@me'; const d = await r.json(); if (d.type === 1 || d.type === 3) return '@me'; return d.guild_id || '@me'; } catch { return '@me'; }
