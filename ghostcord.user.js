@@ -368,7 +368,7 @@
             }
 
             const hits = data.messages.map(extractHit).filter(Boolean);
-            // Two-stage filter: cutoff first (drives early-exit logic), then content filter
+            // Two-stage filter: expiry first, then optional content filter.
             const passedCutoff = hits.filter(m => {
                 if (m.author?.id !== authorId) return false;
                 if (!DELETABLE_TYPES.has(m.type)) return false;
@@ -382,9 +382,8 @@
             const skipped = hits.length - toDelete.length;
 
             if (toDelete.length === 0) {
-                // In autodelete mode, only stop early if the CUTOFF eliminated everything.
-                // If content filter excluded them, keep paging — older messages may still match.
-                if (cutoffTs !== null && passedCutoff.length === 0) { logFn('success', `Channel done — deleted: ${delCount}, failed: ${failCount}`); return; }
+                // Search is newest-first; if nothing on this page is expired or matched,
+                // older pages may still contain deletable messages.
                 if ((data.total_results || 0) - offset > 0) { offset += skipped || 25; await wait(TIMING.searchDelay); return search(); }
                 logFn('success', `Channel done — deleted: ${delCount}, failed: ${failCount}`); return;
             }
@@ -411,8 +410,8 @@
                     } else if ([400, 403, 404].includes(dr.status)) {
                         logFn('warn', `Cannot delete ${msg.id} (HTTP ${dr.status}), skipping.`);
                         offset++; failCount++;
-                    } else { logFn('error', `Delete error HTTP ${dr.status}`); failCount++; }
-                } catch (e) { logFn('error', `Delete threw: ${e.message}`); failCount++; }
+                    } else { logFn('error', `Delete error HTTP ${dr.status}`); offset++; failCount++; }
+                } catch (e) { logFn('error', `Delete threw: ${e.message}`); offset++; failCount++; }
                 await wait(deleteDelay);
             }
 
